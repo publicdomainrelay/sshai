@@ -1,0 +1,5 @@
+dist/
+src/sshai/agi_sshd
+src/sshd/agi_sshd
+__pycache__/
+src/sshai/workflow.schema.json

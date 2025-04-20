@@ -1,0 +1,19 @@
+
+                                /\
+                               /  \
+                              Intent
+                             /      \
+                            /        \
+                           /          \
+                          /            \
+                         /              \
+                        /  Alice is Here \
+                       /                  \
+                      /                    \
+                     /______________________\
+
+             Dynamic Analysis          Static Analysis
+
+    How we built Alice: https://github.com/intel/dffml/tree/main/docs/tutorials/rolling_alice
+    How to extend Alice: https://github.com/intel/dffml/blob/main/CONTRIBUTING.md
+

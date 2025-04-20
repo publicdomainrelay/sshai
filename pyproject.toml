@@ -1,0 +1,69 @@
+[project]
+name = "sshai"
+version = "0.0.1"
+description = "Ghost in Shell via SSH"
+readme = {file = "README.md", content-type = "text/markdown"}
+authors = [
+    { name = "Public Domain", email = "publicdomainrelay@protonmail.com" }
+]
+license = {text = "Unlicense"}
+requires-python = ">=3.12"
+dependencies = [
+    "pip",
+    "setuptools",
+    "wheel",
+    "build",
+    "pyyaml",
+    "snoop",
+    "pytest",
+    "httpx",
+    "cachetools",
+    "aiohttp",
+    "gidgethub[aiohttp]",
+    "celery[redis]",
+    "fastapi",
+    "pydantic",
+    "gunicorn",
+    "uvicorn",
+    "snoop",
+    "openai",
+    "keyring",
+    "keyrings-alt",
+    "libtmux",
+    "psutil",
+    "mcp-proxy@git+https://github.com/johnandersen777/mcp-proxy@mcp_enable_over_unix_socket",
+    "mcp@git+https://github.com/johnandersen777/python-sdk@mcp_enable_over_unix_socket",
+    "openai-agents@git+https://github.com/johnandersen777/openai-agents-python@additional_properties_dict_keys_mcp_enable_over_unix_socket",
+]
+
+[project.urls]
+Repository = "https://github.com/publicdomainrelay/sshai.git"
+Issues = "https://github.com/publicdomainrelay/sshai/issues"
+
+[project.scripts]
+sshai = "sshai.cli:main"
+
+[build-system]
+requires = [
+    "hatchling",
+    "hatch-build-scripts@git+https://github.com/johnandersen777/hatch-build-scripts@patch-1",
+]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build]
+exclude = [
+    "src/sshd/agi_sshd",
+]
+
+[[tool.hatch.build.hooks.build-scripts.scripts]]
+out_dir = "src/sshai"
+work_dir = "src/sshd"
+commands = [
+    "CGO_ENABLED=0 go build -tags netgo -o agi_sshd agi_sshd.go",
+]
+artifacts = [
+    "agi_sshd",
+]

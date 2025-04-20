@@ -1,0 +1,12 @@
+agi_sshd.Dockerfile:COPY go.mod go.sum ./
+agi_sshd.Dockerfile:COPY agi_sshd.go .
+agi_sshd.Dockerfile:COPY ./entrypoint.sh /host/entrypoint.sh
+agi_sshd.Dockerfile:COPY server_motd /host/
+agi_sshd.Dockerfile:COPY openai_assistant_instructions.md /host/
+agi_sshd.Dockerfile:COPY agi.py /host/
+agi_sshd.Dockerfile:COPY util.sh /host/
+agi_sshd.Dockerfile:COPY entrypoint-server.sh /host/
+agi_sshd.Dockerfile:COPY entrypoint.sh /host/
+agi_sshd.Dockerfile:COPY mcp_server_files.py /host/
+agi_sshd.Dockerfile:COPY Caddyfile /host/
+agi_sshd.Dockerfile:COPY --from=builder_golang_agi_sshd /usr/src/app/agi_sshd /usr/bin/agi_sshd
