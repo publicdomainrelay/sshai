@@ -306,6 +306,7 @@ import gunicorn.app.base
 from celery import Celery, current_app as celery_current_app
 from celery.result import AsyncResult
 from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
 from pydantic import (
     BaseModel,
     PlainSerializer,
@@ -5512,6 +5513,15 @@ async def connect(request_connect_tmux: RequestConnectTMUX, background_tasks: Ba
     return {
         "connected": True,
     }
+
+
+@app.get(
+    "/files/{filename}",
+    response_class=PlainTextResponse,
+)
+async def get_file(filename: str) -> str:
+    filename = os.path.basename(filename)
+    return pathlib.Path(__file__).parent.joinpath(filename).read_text()
 
 
 async def run_custom_sshd(uds: str):
