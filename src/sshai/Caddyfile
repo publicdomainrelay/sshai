@@ -1,6 +1,6 @@
 {
     # Expose Caddy’s admin API on a Unix socket
-    admin unix/{{CALLER_PATH}}/caddy-admin.sock
+    admin unix/{{AGI_SOCK_DIR}}/caddy-admin.sock
     auto_https off
     log default {
         level debug
@@ -11,5 +11,5 @@
 http://127.0.0.1 {
     bind unix/{{AGI_SOCK_DIR}}/mcp-reverse-proxy.sock
 
-    reverse_proxy unix/{{CALLER_PATH}}/caddy-admin.sock
+    reverse_proxy unix/{{AGI_SOCK_DIR}}/caddy-admin.sock
 }

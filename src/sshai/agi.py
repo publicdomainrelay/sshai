@@ -3650,6 +3650,7 @@ def get_tmux_window_info(*, server: libtmux.Server = None):
 
 @dataclasses.dataclass
 class UserContext:
+    mcp_reverse_proxy_socket_path: str
     tmux_context: TmuxContext = Field(default_factory=TmuxContext)
 
 
@@ -3678,6 +3679,8 @@ async def execute_generated_workflow(
     snoop.pp("execute_generated_workflow", workflow)
     tmux_context = wrapper.context.tmux_context
     pane = tmux_context.pane
+    policy_engine_task_id = None
+
     if pane is not None:
         session = pane.window.session
         tempdir_lookup_env_var = f'TEMPDIR_ENV_VAR_TMUX_WINDOW_{session.active_window.id.replace("@", "")}'
@@ -3722,7 +3725,42 @@ async def execute_generated_workflow(
             enter=True,
         )
         pane.send_keys(f"submit_policy_engine_request", enter=True)
-    return f"User terminal multiplexer context is {tmux_context.model_dump_json()}"
+
+        # TODO(windows) Env dumping changes on Windows
+        echo_policy_engine_task_id = 'echo POLICY_ENGINE_TASK_ID="${POLICY_ENGINE_TASK_ID}"'
+        pane.send_keys(echo_policy_engine_task_id, enter=True)
+        while not any([line.startswith("POLICY_ENGINE_TASK_ID=") for line in pane.capture_pane()]):
+            await asyncio.sleep(0.1)
+
+        policy_engine_task_id = list(
+            [
+                line.strip().split("POLICY_ENGINE_TASK_ID=", maxsplit=1)[-1]
+                for line in pane.capture_pane()
+                if line.startswith("POLICY_ENGINE_TASK_ID=")
+            ]
+        )[0]
+
+    else:
+        # TODO Send workflow to policy engine via pty or forwarded socket
+        raise NotImplementedError("Only TMUX support for workflow exec currently")
+
+    if policy_engine_task_id is None:
+        raise Exception("Failed to get policy engine task ID to capture output")
+
+    transport = httpx.AsyncHTTPTransport(
+        uds=wrapper.context.mcp_reverse_proxy_socket_path,
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get(
+            f"http://policy-engine/request/status/{policy_engine_task_id}",
+        )
+        request_status = response.json()
+        response = await client.get(
+            f"http://policy-engine/request/console_output/{policy_engine_task_id}",
+        )
+        snoop.pp(request_status, response.status_code, response.text)
+        response.raise_for_status()
+        return response.text
 
 
 class AGIThreadNotFoundError(Exception):
@@ -4587,6 +4625,7 @@ async def main(
             session=None if pane is None else pane.session,
             pane=None if pane is None else pane,
         ),
+        mcp_reverse_proxy_socket_path=mcp_reverse_proxy_socket_path,
     )
 
     kvstore_key_agent_id = f"agents.{agi_name}.id"
@@ -5194,6 +5233,8 @@ async def tmux_test(
         pane.send_keys(echo_caller_path, enter=True)
         while not any([line.startswith("CALLER_PATH=") for line in pane.capture_pane()]):
             await asyncio.sleep(0.1)
+
+        await caddy_config_update(mcp_reverse_proxy_socket_path, "policy-engine")
 
         await main(
             *args,

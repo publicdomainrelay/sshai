@@ -109,17 +109,12 @@ if [ ! -f "${CALLER_PATH}/policy_engine.logs.txt" ]; then
     policy_engine_deps
 fi
 
-NO_CELERY=1 python -u ${CALLER_PATH}/policy_engine.py api --bind 127.0.0.1:0 --workers 1 1>"${CALLER_PATH}/policy_engine.logs.txt" 2>&1 &
+export ${AGI_NAME}_POLICY_ENGINE_SOCK="${!agi_sock_dir}/policy-engine.sock"
+export agi_policy_engine_sock="${AGI_NAME}_POLICY_ENGINE_SOCK"
+NO_CELERY=1 python -u ${CALLER_PATH}/policy_engine.py api --bind "unix:${!agi_policy_engine_sock}" --workers 1 1>"${CALLER_PATH}/policy_engine.logs.txt" 2>&1 &
 POLICY_ENGINE_PID=$!
 PIDs+=("${POLICY_ENGINE_PID}")
 
-until find_listening_ports "$POLICY_ENGINE_PID"; do sleep 0.01; done
-
-export POLICY_ENGINE_PORT=$(find_listening_ports "$POLICY_ENGINE_PID")
-
-echo "${POLICY_ENGINE_PORT}" > "${CALLER_PATH}/policy_engine_port.txt"
-
-set +e
 submit_policy_engine_request
 
 export ${AGI_NAME}_MCP_REVERSE_PROXY_SOCK="${!agi_sock_dir}/mcp-reverse-proxy.sock"
@@ -186,11 +181,11 @@ PIDs+=("${CADDY_PID}")
 # cd ${CALLER_PATH}
 # npm install @wonderwhy-er/desktop-commander@latest
 # python -um mcp_proxy --sse-uds ${CALLER_PATH}/desktopcommander.sock -- npx @wonderwhy-er/desktop-commander@latest start 1>"${CALLER_PATH}/mcp_server_desktopcommander.logs.txt" 2>&1 &
-python -um mcp_proxy --sse-uds ${CALLER_PATH}/desktopcommander.sock -- uvx mcp-server-fetch 1>"${CALLER_PATH}/mcp_server_desktopcommander.logs.txt" 2>&1 &
+python -um mcp_proxy --sse-uds "${!agi_sock_dir}/desktopcommander.sock" -- uvx mcp-server-fetch 1>"${CALLER_PATH}/mcp_server_desktopcommander.logs.txt" 2>&1 &
 MCP_SERVER_DESKTOPCOMMANDER_PID=$!
 PIDs+=("${MCP_SERVER_DESKTOPCOMMANDER_PID}")
 
-python -u ${CALLER_PATH}/mcp_server_files.py --transport sse --uds ${CALLER_PATH}/files.sock 1>"${CALLER_PATH}/mcp_server_files.logs.txt" 2>&1 &
+python -u ${CALLER_PATH}/mcp_server_files.py --transport sse --uds "${!agi_sock_dir}/files.sock" 1>"${CALLER_PATH}/mcp_server_files.logs.txt" 2>&1 &
 MCP_SERVER_FILES_PID=$!
 PIDs+=("${MCP_SERVER_FILES_PID}")
 

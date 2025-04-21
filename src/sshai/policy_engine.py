@@ -371,6 +371,7 @@ class PolicyEngineStatus(BaseModel, extra="forbid"):
         PolicyEngineUnknown,
         List[PolicyEngineInputValidationError],
     ]
+    console_output: Optional[str] = Field(default=None)
 
     @model_validator(mode="before")
     @classmethod
@@ -1806,6 +1807,12 @@ async def async_celery_run_workflow(context, request):
     request_status = PolicyEngineStatus(
         status=PolicyEngineStatuses.COMPLETE,
         detail=detail,
+        console_output="\n".join(
+            [
+                console_output.decode(errors="replace")
+                for _stack_path, console_output in request.context["console_output"]
+            ]
+        ),
     )
     return request_status
 
@@ -1912,6 +1919,7 @@ def make_fastapi_app(
             detail_class = DETAIL_CLASS_MAPPING[status["status"]]
             status["detail"] = detail_class(**status["detail"])
             request_status = PolicyEngineStatus(**status)
+            request_status.console_output = None
             request_status.detail.id = request_id
         else:
             request_status = PolicyEngineStatus(
@@ -1937,12 +1945,13 @@ def make_fastapi_app(
             request_task = AsyncResult(request_id, app=celery_app)
             request_task_state = request_task.state
         if request_task_state in ("SUCCESS", "FAILURE"):
-            return "\n".join(
-                [
-                    console_output.encode(errors="replace")
-                    for _stack_path, console_output in request.context["console_output"]
-                ]
-            )
+            async with fastapi_request.state.no_celery_async_results_lock:
+                status_json_string = request_task.get()
+            status = json.loads(status_json_string)
+            detail_class = DETAIL_CLASS_MAPPING[status["status"]]
+            status["detail"] = detail_class(**status["detail"])
+            request_status = PolicyEngineStatus(**status)
+            return request_status.console_output
         raise HTTPException(
             status_code=http.HTTPStatus.NO_CONTENT.value,
             detail=request_task_state,

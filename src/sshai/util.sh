@@ -12,20 +12,32 @@ deno_install() {
   fi
 }
 
+check_policy_engine_request() {
+    local agi_policy_engine_sock="${AGI_NAME}_POLICY_ENGINE_SOCK"
+    curl --unix-socket "${!agi_policy_engine_sock}" -sfL http://localhost/request/status/$POLICY_ENGINE_TASK_ID | jq
+}
+
 submit_policy_engine_request() {
     tail -F "${CALLER_PATH}/policy_engine.logs.txt" &
     TAIL_PID=$!
 
-    export POLICY_ENGINE_PORT=$(cat "${CALLER_PATH}/policy_engine_port.txt")
+    local agi_policy_engine_sock="${AGI_NAME}_POLICY_ENGINE_SOCK"
+    if ! [ -S "${!agi_policy_engine_sock}" ]; then
+      NO_CELERY=1 python -u ${CALLER_PATH}/policy_engine.py api --bind "unix:${!agi_policy_engine_sock}" --workers 1 1>"${CALLER_PATH}/policy_engine.logs.txt" 2>&1 &
+    fi
+    until [ -S "${!agi_policy_engine_sock}" ]; do
+      sleep 0.01
+    done
 
-    TASK_ID=$(curl -X POST -H "Content-Type: application/json" -d @<(cat "${CALLER_PATH}/request.yml" | python -c 'import json, yaml, sys; print(json.dumps(yaml.safe_load(sys.stdin.read()), indent=4, sort_keys=True))') http://localhost:$POLICY_ENGINE_PORT/request/create  | jq -r .detail.id)
+    export POLICY_ENGINE_TASK_ID=$(curl --unix-socket "${!agi_policy_engine_sock}" -X POST -H "Content-Type: application/json" -d @<(cat "${CALLER_PATH}/request.yml" | python -c 'import json, yaml, sys; print(json.dumps(yaml.safe_load(sys.stdin.read()), indent=4, sort_keys=True))') http://localhost/request/create  | jq -r .detail.id)
 
-    STATUS=$(curl -sfL http://localhost:$POLICY_ENGINE_PORT/request/status/$TASK_ID | jq -r .status)
+    STATUS=$(curl --unix-socket "${!agi_policy_engine_sock}" -sfL http://localhost/request/status/$POLICY_ENGINE_TASK_ID | jq -r .status)
     while [ "x${STATUS}" != "xcomplete" ]; do
-        STATUS=$(curl -sfL http://localhost:$POLICY_ENGINE_PORT/request/status/$TASK_ID | jq -r .status)
+        STATUS=$(curl --unix-socket "${!agi_policy_engine_sock}" -sfL http://localhost/request/status/$POLICY_ENGINE_TASK_ID | jq -r .status)
+        sleep 0.01
     done
     kill "${TAIL_PID}"
-    STATUS=$(curl -sfL http://localhost:$POLICY_ENGINE_PORT/request/status/$TASK_ID | python -m json.tool > "${CALLER_PATH}/last-request-status.json")
+    STATUS=$(curl --unix-socket "${!agi_policy_engine_sock}" -sfL http://localhost/request/status/$POLICY_ENGINE_TASK_ID | python -m json.tool > "${CALLER_PATH}/last-request-status.json")
     cat "${CALLER_PATH}/last-request-status.json" | jq
     export STATUS=$(cat "${CALLER_PATH}/last-request-status.json" | jq -r .status)
 }
