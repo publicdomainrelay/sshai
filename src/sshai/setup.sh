@@ -52,7 +52,7 @@ add_cleanup_function cleanup_pids
 add_cleanup_function cleanup_dirs
 
 mkdir -pv "${CALLER_PATH}"
-directories+=("${CALLER_PATH}")
+# directories+=("${CALLER_PATH}")
 rm -f "${CALLER_PATH}/input.txt"
 touch "${CALLER_PATH}/input.txt"
 rm -f "${CALLER_PATH}/input-last-line.txt"
@@ -130,18 +130,18 @@ sed -i -e "s#{{AGI_SOCK_DIR}}#${!agi_sock_dir}#g" "${CALLER_PATH}/Caddyfile"
 
 curl -s --unix-socket "${!agi_sock}" -fLo "${CALLER_PATH}/mcp_server_files.py" http://localhost/files/mcp_server_files.py
 
-curl -v --unix-socket "${!agi_sock}" -fLo "${CALLER_PATH}/gosocat" http://localhost/files/gosocat
-chmod 700 "${CALLER_PATH}/gosocat"
-
 export agi_output="${AGI_NAME}_OUTPUT"
 export agi_output_sock="${AGI_NAME}_OUTPUT_SOCK"
 export ${AGI_NAME}_OUTPUT="${CALLER_PATH}/output.txt"
 export ${AGI_NAME}_OUTPUT_SOCK="${!agi_sock_dir}/text-output.sock"
 rm -fv "${!agi_output_sock}"
 touch "${!agi_output}"
-socat "UNIX-LISTEN:${!agi_output_sock},fork" "OPEN:${!agi_output},creat,append" &
+socat "UNIX-LISTEN:${!agi_output_sock},fork" EXEC:"/usr/bin/tee ${!agi_output}" &
 OUTPUT_SOCK_PID=$!
 PIDs+=("${OUTPUT_SOCK_PID}")
+until [ -S "${!agi_output_sock}" ]; do
+  sleep 0.01
+done
 until [ -f "${!agi_output}" ]; do
   sleep 0.01
 done
@@ -153,9 +153,12 @@ export ${AGI_NAME}_NDJSON_OUTPUT="${CALLER_PATH}/output.ndjson"
 export ${AGI_NAME}_NDJSON_OUTPUT_SOCK="${!agi_sock_dir}/ndjson-output.sock"
 rm -fv "${!agi_ndjson_output_sock}"
 touch "${!agi_ndjson_output}"
-socat "UNIX-LISTEN:${!agi_ndjson_output_sock},fork" "OPEN:${!agi_ndjson_output},creat,append" &
+socat "UNIX-LISTEN:${!agi_ndjson_output_sock},fork" EXEC:"/usr/bin/tee ${!agi_ndjson_output}" &
 NDJSON_OUTPUT_SOCK_PID=$!
 PIDs+=("${NDJSON_OUTPUT_SOCK_PID}")
+until [ -S "${!agi_ndjson_output_sock}" ]; do
+  sleep 0.01
+done
 until [ -f "${!agi_ndjson_output}" ]; do
   sleep 0.01
 done
@@ -187,11 +190,9 @@ python -um mcp_proxy --sse-uds ${CALLER_PATH}/desktopcommander.sock -- uvx mcp-s
 MCP_SERVER_DESKTOPCOMMANDER_PID=$!
 PIDs+=("${MCP_SERVER_DESKTOPCOMMANDER_PID}")
 
-if [ ! -f "${CALLER_PATH}/mcp_server_files.logs.txt" ]; then
-    python -u ${CALLER_PATH}/mcp_server_files.py --transport sse --uds ${CALLER_PATH}/files.sock 1>"${CALLER_PATH}/mcp_server_files.logs.txt" 2>&1 &
-    MCP_SERVER_FILES_PID=$!
-    PIDs+=("${MCP_SERVER_FILES_PID}")
-fi
+python -u ${CALLER_PATH}/mcp_server_files.py --transport sse --uds ${CALLER_PATH}/files.sock 1>"${CALLER_PATH}/mcp_server_files.logs.txt" 2>&1 &
+MCP_SERVER_FILES_PID=$!
+PIDs+=("${MCP_SERVER_FILES_PID}")
 
 if [ "x${AGI_DEBUG}" != "x" ]; then
   set +x
