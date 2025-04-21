@@ -306,7 +306,7 @@ import gunicorn.app.base
 from celery import Celery, current_app as celery_current_app
 from celery.result import AsyncResult
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import Response
 from pydantic import (
     BaseModel,
     PlainSerializer,
@@ -4403,17 +4403,20 @@ async def read_unix_socket_lines(path):
 async def write_unix_socket(path):
     # Connect to the Unix socket
     reader, writer = await asyncio.open_unix_connection(path)
-    try:
-        while True:
-            data = yield
-            if data is None:
-                continue
-            writer.write(data)
-            await writer.drain()
-    finally:
-        # Close the connection
-        writer.close()
-        await writer.wait_closed()
+    while True:
+        try:
+            while True:
+                data = yield
+                if data is None:
+                    continue
+                writer.write(data)
+                await writer.drain()
+        except ConnectionResetError:
+            reader, writer = await asyncio.open_unix_connection(path)
+        finally:
+            # Close the connection
+            writer.close()
+            await writer.wait_closed()
 
 
 async def pdb_action_stream(tg, user_name, agi_name, agents, threads, pane: Optional[libtmux.Pane] = None, input_socket_path: Optional[str] = None):
@@ -5075,6 +5078,9 @@ async def tmux_test(
     pane = None
     tempdir = None
     possible_tempdir = tempdir
+
+    client_side_agi_socket_path = str(pathlib.Path(client_side_ndjson_output_socket_path).parent.joinpath("agi.sock"))
+
     try:
         server = libtmux.Server(
             socket_path=socket_path,
@@ -5134,7 +5140,7 @@ async def tmux_test(
             echo_caller_path = 'echo CALLER_PATH="${CALLER_PATH}"'
             pane.send_keys(echo_caller_path, enter=True)
             while not any([line.startswith("CALLER_PATH=") for line in pane.capture_pane()]):
-                time.sleep(0.1)
+                await asyncio.sleep(0.1)
 
             tempdir = list(
                 [
@@ -5144,18 +5150,9 @@ async def tmux_test(
                 ]
             )[0]
 
-        pane.send_keys(
-            textwrap.dedent(
-                r"""
-                bootstrap=$(mktemp -d); tee -a "${bootstrap}/setup.sh"
-                """,
-            ),
-            enter=True,
-        )
-
-
         export_caller_path = f'export CALLER_PATH="{tempdir}"'
         pane.send_keys(export_caller_path , enter=True)
+        pane.send_keys(f"export TEMPDIR='{tempdir}'", enter=True)
 
         session.set_environment(tempdir_lookup_env_var, tempdir_env_var)
         session.set_environment(tempdir_env_var, tempdir)
@@ -5164,144 +5161,19 @@ async def tmux_test(
         session.set_environment(f"{agi_name.upper()}_INPUT_SOCK", client_side_input_socket_path)
         session.set_environment(f"{agi_name.upper()}_INPUT_LAST_LINE", str(pathlib.Path(tempdir, "input-last-line.txt")))
 
+        pane.send_keys(f"export AGI_PS1='{agi_name} $ '", enter=True)
+        pane.send_keys(f"export AGI_NAME={agi_name.upper()}", enter=True)
+
+        sock_dir = str(pathlib.Path(client_side_ndjson_output_socket_path).parent)
+        pane.send_keys(f"export {agi_name.upper()}_SOCK_DIR=" + sock_dir, enter=True)
+        pane.send_keys(f"export {agi_name.upper()}_AGI_SOCK=" + client_side_agi_socket_path, enter=True)
+
+        pane.send_keys('bootstrap=$(mktemp -d)', enter=True)
         pane.send_keys(
-            textwrap.dedent(
-                r"""
-                mkdir -pv "${CALLER_PATH}"
-                rm -f "${CALLER_PATH}/input.txt"
-                touch "${CALLER_PATH}/input.txt"
-                rm -f "${CALLER_PATH}/input-last-line.txt"
-                touch "${CALLER_PATH}/input-last-line.txt"
-                """,
-            ),
+            f'curl -s --unix-socket ${agi_name.upper()}_AGI_SOCK' + r' -fLo "${bootstrap}/setup.sh" http://localhost/files/setup.sh',
             enter=True,
         )
-
-        pane.send_keys(
-            'cat > "${CALLER_PATH}/util.sh" <<\'WRITE_OUT_SH_EOF\''
-            + "\n"
-            + pathlib.Path(__file__).parent.joinpath("util.sh").read_text(),
-            enter=True,
-        )
-        pane.send_keys('', enter=True)
-        pane.send_keys('WRITE_OUT_SH_EOF', enter=True)
-
-        pane.send_keys(
-            "cat > \"${CALLER_PATH}/entrypoint.sh\" <<\'WRITE_OUT_SH_EOF\'"
-            + "\n"
-            + textwrap.dedent(
-                f"""
-                #!/usr/bin/env bash
-                set -xeuo pipefail
-
-                # trap bash EXIT
-
-                if [ "x$CALLER_PATH" = "x" ]; then
-                    export CALLER_PATH="{tempdir}"
-                fi
-                export PS1='{ps1}'
-
-                """
-            ).lstrip()
-            + pathlib.Path(__file__).parent.joinpath("entrypoint.sh").read_text(),
-            enter=True
-        )
-        pane.send_keys('', enter=True)
-        pane.send_keys('WRITE_OUT_SH_EOF', enter=True)
-        pane.send_keys('chmod 700 "${CALLER_PATH}/entrypoint.sh"', enter=True)
-
-        workflow = PolicyEngineWorkflow(
-            on=["push"],
-            name=None,
-            jobs={
-                "ssh": PolicyEngineWorkflowJob(
-                    runs_on="target",
-                    steps=[
-                        PolicyEngineWorkflowJobStep(
-                            id=None,
-                            if_condition=True,
-                            name=None,
-                            uses=None,
-                            shell=None,
-                            with_inputs=None,
-                            env=None,
-                            run=textwrap.dedent(
-                                """
-                                echo Hello World
-                                """
-                            ),
-                        )
-                    ]
-                )
-            },
-        )
-        proposed_workflow_contents = yaml.dump(
-            json.loads(workflow.model_dump_json()),
-            default_flow_style=False,
-            sort_keys=True,
-        )
-        request_contents = yaml.dump(
-            json.loads(
-                PolicyEngineRequest(
-                    inputs={},
-                    context={},
-                    stack={},
-                    workflow=workflow,
-                ).model_dump_json(),
-            )
-        )
-
-        pane.send_keys(
-            "cat > \"${CALLER_PATH}/proposed-workflow.yml\" <<\'WRITE_OUT_SH_EOF\'"
-            + "\n"
-            + proposed_workflow_contents
-            + "\nWRITE_OUT_SH_EOF",
-            enter=True,
-        )
-        pane.send_keys(
-            "cat > \"${CALLER_PATH}/request.yml\" <<\'WRITE_OUT_SH_EOF\'"
-            + "\n"
-            + request_contents
-            + "\nWRITE_OUT_SH_EOF",
-            enter=True,
-        )
-
-        pane.send_keys(
-            r'curl -vfLo "${CALLER_PATH}/policy_engine.py" https://github.com/pdxjohnny/scitt-api-emulator/raw/policy_engine_cwt_rebase/scitt_emulator/policy_engine.py',
-            enter=True,
-        )
-
-        pane.send_keys('set +e', enter=True)
-        pane.send_keys('export FAIL_ON_ERROR=0', enter=True)
-        pane.send_keys('source "${CALLER_PATH}/entrypoint.sh"', enter=True)
-        pane.send_keys('unset FAIL_ON_ERROR', enter=True)
-        pane.send_keys('source "${CALLER_PATH}/util.sh"', enter=True)
-        pane.send_keys(
-            textwrap.dedent(
-                '''
-                if [ ! -f "${CALLER_PATH}/policy_engine.logs.txt" ]; then
-                    policy_engine_deps
-
-                    NO_CELERY=1 python -u ${CALLER_PATH}/policy_engine.py api --bind 127.0.0.1:0 --workers 1 1>"${CALLER_PATH}/policy_engine.logs.txt" 2>&1 &
-                    POLICY_ENGINE_PID=$!
-
-                    until find_listening_ports "$POLICY_ENGINE_PID"; do sleep 0.01; done
-
-                    export POLICY_ENGINE_PORT=$(find_listening_ports "$POLICY_ENGINE_PID")
-
-                    echo "${POLICY_ENGINE_PORT}" > "${CALLER_PATH}/policy_engine_port.txt"
-                fi
-                '''.lstrip(),
-            ),
-            enter=True,
-        )
-        pane.send_keys("set +e", enter=True)
-        pane.send_keys("submit_policy_engine_request", enter=True)
-
-        pane.send_keys("", enter=True)
-        pane.send_keys("\x04", enter=True)
-        pane.send_keys("", enter=True)
-
+        pane.send_keys('export AGI_DEBUG=1', enter=True)
         pane.send_keys('. "${bootstrap}/setup.sh"', enter=True)
 
         # pane.send_keys('set -x', enter=True)
@@ -5309,85 +5181,19 @@ async def tmux_test(
         # pane.send_keys('docker run --rm -ti -e CALLER_PATH="/host" -v "${' + tempdir_env_var + '}:/host:z" --entrypoint /host/entrypoint.sh registry.fedoraproject.org/fedora' +'; rm -rfv ${' + tempdir_env_var + '}', enter=True)
 
         # TODO Error handling, immediate trampoline python socket nest
-        lines = pane.capture_pane()
-        while lines and ps1.strip() != "".join(lines[-1:]).strip():
+        try:
             lines = pane.capture_pane()
-            time.sleep(0.1)
+            while lines and ps1.strip() != "".join(lines[-1:]).strip():
+                lines = pane.capture_pane()
+                await asyncio.sleep(0.1)
+        except Exception as error:
+            snoop.pp(error)
+            traceback.print_exc()
 
-        pane.send_keys(f"export {agi_name.upper()}_OUTPUT=" + str(pathlib.Path(tempdir, "output.txt")), enter=True)
-        pane.send_keys(f'export {agi_name.upper()}_OUTPUT_SOCK="{client_side_text_output_socket_path}"', enter=True)
-        pane.send_keys(f'rm -fv ${agi_name.upper()}_OUTPUT_SOCK', enter=True)
-        pane.send_keys(f'socat UNIX-LISTEN:${agi_name.upper()}_OUTPUT_SOCK,fork EXEC:"/usr/bin/tee ${agi_name.upper()}_OUTPUT" &', enter=True)
-        pane.send_keys(f'ls -lAF ${agi_name.upper()}_OUTPUT', enter=True)
-
-        pane.send_keys(f"export {agi_name.upper()}_NDJSON_OUTPUT=" + str(pathlib.Path(tempdir, "output.ndjson")), enter=True)
-        pane.send_keys(f'export {agi_name.upper()}_NDJSON_OUTPUT_SOCK="{client_side_ndjson_output_socket_path}"', enter=True)
-        pane.send_keys(f'rm -fv ${agi_name.upper()}_NDJSON_OUTPUT_SOCK', enter=True)
-        pane.send_keys(f'socat UNIX-LISTEN:${agi_name.upper()}_NDJSON_OUTPUT_SOCK,fork EXEC:"/usr/bin/tee ${agi_name.upper()}_NDJSON_OUTPUT" &', enter=True)
-        pane.send_keys(f'ls -lAF ${agi_name.upper()}_NDJSON_OUTPUT', enter=True)
-
-        pane.send_keys(f"export {agi_name.upper()}_INPUT=" + str(pathlib.Path(tempdir, "input.txt")), enter=True)
-        pane.send_keys(f'export {agi_name.upper()}_INPUT_SOCK="{client_side_input_socket_path}"', enter=True)
-        pane.send_keys(f"export {agi_name.upper()}_INPUT_LAST_LINE=" + str(pathlib.Path(tempdir, "input-last-line.txt")), enter=True)
-        pane.send_keys(f'rm -fv ${agi_name.upper()}_INPUT_SOCK', enter=True)
-        pane.send_keys(f'socat UNIX-LISTEN:${agi_name.upper()}_INPUT_SOCK,fork EXEC:"/usr/bin/tail -F ${agi_name.upper()}_INPUT" &', enter=True)
-        pane.send_keys(f'ls -lAF ${agi_name.upper()}_INPUT', enter=True)
-
-        pane.send_keys(
-            'cat > "${CALLER_PATH}/Caddyfile" <<\'WRITE_OUT_SH_EOF\''
-            + "\n"
-            + pathlib.Path(__file__).parent.joinpath("Caddyfile").read_text().replace("{{CALLER_PATH}}", tempdir).replace("{{CLIENT_SIDE_MCP_REVERSE_PROXY_SOCKET_PATH}}", client_side_mcp_reverse_proxy_socket_path),
-            enter=True,
-        )
-        pane.send_keys('', enter=True)
-        pane.send_keys('WRITE_OUT_SH_EOF', enter=True)
-
-        # if [ ! -f "${CALLER_PATH}/caddy.logs.txt" ]; then
-        pane.send_keys(
-            textwrap.dedent(
-                '''
-                HOME=${CALLER_PATH} caddy run --config ${CALLER_PATH}/Caddyfile 1>"${CALLER_PATH}/caddy.logs.txt" 2>&1 &
-                CADDY_PID=$!
-                '''.lstrip(),
-            ),
-            enter=True,
-        )
-
-        # cd ${CALLER_PATH}
-        # npm install @wonderwhy-er/desktop-commander@latest
-        # python -um mcp_proxy --sse-uds ${CALLER_PATH}/desktopcommander.sock -- npx @wonderwhy-er/desktop-commander@latest start 1>"${CALLER_PATH}/mcp_server_desktopcommander.logs.txt" 2>&1 &
-        pane.send_keys(
-            textwrap.dedent(
-                '''
-                python -um mcp_proxy --sse-uds ${CALLER_PATH}/desktopcommander.sock -- uvx mcp-server-fetch 1>"${CALLER_PATH}/mcp_server_desktopcommander.logs.txt" 2>&1 &
-                MCP_SERVER_DESKTOPCOMMANDER_PID=$!
-                '''.lstrip(),
-            ),
-            enter=True,
-        )
-
-        pane.send_keys(
-            'cat > "${CALLER_PATH}/mcp_server_files.py" <<\'WRITE_OUT_SH_EOF\''
-            + "\n"
-            + pathlib.Path(__file__).parent.joinpath("mcp_server_files.py").read_text(),
-            enter=True,
-        )
-        pane.send_keys('', enter=True)
-        pane.send_keys('WRITE_OUT_SH_EOF', enter=True)
-
-        pane.send_keys(
-            textwrap.dedent(
-                '''
-                if [ ! -f "${CALLER_PATH}/mcp_server_files.logs.txt" ]; then
-                    python -u ${CALLER_PATH}/mcp_server_files.py --transport sse --uds ${CALLER_PATH}/files.sock 1>"${CALLER_PATH}/mcp_server_files.logs.txt" 2>&1 &
-                    MCP_SERVER_FILES_PID=$!
-                fi
-                '''.lstrip(),
-            ),
-            enter=True,
-        )
-
-        pane.send_keys(f'set +x', enter=True)
+        echo_caller_path = 'echo CALLER_PATH="${CALLER_PATH}"'
+        pane.send_keys(echo_caller_path, enter=True)
+        while not any([line.startswith("CALLER_PATH=") for line in pane.capture_pane()]):
+            await asyncio.sleep(0.1)
 
         await main(
             *args,
@@ -5427,10 +5233,10 @@ app = FastAPI(lifespan=lifespan_logging)
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    snoop.pp(exc.detail, await request.json())
+    snoop.pp(exc, await request.json())
     return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content=jsonable_encoder({"detail": exc.errors(), "body": exc.body}),
+        status_code=http.HTTPStatus.UNPROCESSABLE_CONTENT.value,
+        content=json.dumps({"detail": exc.errors(), "body": exc.body}),
     )
 
 
@@ -5517,11 +5323,14 @@ async def connect(request_connect_tmux: RequestConnectTMUX, background_tasks: Ba
 
 @app.get(
     "/files/{filename}",
-    response_class=PlainTextResponse,
+    response_class=Response,
 )
 async def get_file(filename: str) -> str:
     filename = os.path.basename(filename)
-    return pathlib.Path(__file__).parent.joinpath(filename).read_text()
+    file_path = pathlib.Path(__file__).parent.joinpath(filename)
+    if filename in ("gosocat"):
+        return Response(content=file_path.read_bytes(), media_type="application/octet-stream")
+    return Response(content=file_path.read_text(), media_type="text/plain")
 
 
 async def run_custom_sshd(uds: str):

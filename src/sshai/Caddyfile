@@ -9,7 +9,7 @@
 
 # Listen on a Unix socket
 http://127.0.0.1 {
-    bind unix/{{CLIENT_SIDE_MCP_REVERSE_PROXY_SOCKET_PATH}}
+    bind unix/{{AGI_SOCK_DIR}}/mcp-reverse-proxy.sock
 
     reverse_proxy unix/{{CALLER_PATH}}/caddy-admin.sock
 }

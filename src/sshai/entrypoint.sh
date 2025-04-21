@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -xo pipefail
+set -o pipefail
 
 if [[ "x${FAIL_ON_ERROR}" != "x0" ]]; then
   set -e

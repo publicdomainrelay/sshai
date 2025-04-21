@@ -221,6 +221,7 @@ import time
 import enum
 import uuid
 import copy
+import http
 import shlex
 import types
 import atexit
@@ -266,7 +267,8 @@ import gidgethub.aiohttp
 import gunicorn.app.base
 from celery import Celery, current_app as celery_current_app
 from celery.result import AsyncResult
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import (
     BaseModel,
     PlainSerializer,
@@ -1639,6 +1641,7 @@ class LifespanCallbackWithConfig(BaseModel):
             raise ValueError(
                 "Must specify either (entrypoint_string and config_string) or (callback and config_string) via kwargs"
             )
+        return self
 
     def __call__(self, *args, **kwargs):
         return self.callback(self.config_string, *args, **kwargs)
@@ -1698,7 +1701,7 @@ class PolicyEngineContext(BaseModel, extra="forbid"):
             [
                 lifespan_callback
                 if isinstance(lifespan_callback, LifespanCallbackWithConfig)
-                else LifespanCallbackWithConfig(**lifespan_callback)
+                else LifespanCallbackWithConfig.model_validate(lifespan_callback)
                 for lifespan_callback in lifespan
             ]
         )
@@ -1919,6 +1922,32 @@ def make_fastapi_app(
             )
         return request_status
 
+    @app.get(
+        "/request/console_output/{request_id}",
+        response_class=PlainTextResponse,
+    )
+    async def route_policy_engine_status(
+        request_id: str,
+        fastapi_request: Request,
+    ) -> str:
+        global celery_app
+        fastapi_current_app.set(fastapi_request.app)
+        fastapi_current_request.set(fastapi_request)
+        async with fastapi_request.state.no_celery_async_results_lock:
+            request_task = AsyncResult(request_id, app=celery_app)
+            request_task_state = request_task.state
+        if request_task_state in ("SUCCESS", "FAILURE"):
+            return "\n".join(
+                [
+                    console_output.encode(errors="replace")
+                    for _stack_path, console_output in request.context["console_output"]
+                ]
+            )
+        raise HTTPException(
+            status_code=http.HTTPStatus.NO_CONTENT.value,
+            detail=request_task_state,
+        )
+
     @app.post("/request/create")
     async def route_request(
         request: PolicyEngineRequest,
@@ -1997,26 +2026,26 @@ async def lifespan_no_celery(
 
 
 DEFAULT_LIFESPAN_CALLBACKS = [
-    LifespanCallbackWithConfig(
+    LifespanCallbackWithConfig.model_validate(dict(
         callback=lifespan_no_celery,
         config_string=os.environ.get("NO_CELERY", "0"),
-    ),
-    LifespanCallbackWithConfig(
+    )),
+    LifespanCallbackWithConfig.model_validate(dict(
         callback=lifespan_gidgethub,
         config_string="",
-    ),
-    LifespanCallbackWithConfig(
+    )),
+    LifespanCallbackWithConfig.model_validate(dict(
         callback=lifespan_github_token,
         config_string="try_env",
-    ),
-    LifespanCallbackWithConfig(
+    )),
+    LifespanCallbackWithConfig.model_validate(dict(
         callback=lifespan_deno,
         config_string="https://github.com/denoland/deno/releases/download/v1.41.3/deno-x86_64-unknown-linux-gnu.zip",
-    ),
-    LifespanCallbackWithConfig(
+    )),
+    LifespanCallbackWithConfig.model_validate(dict(
         callback=lifespan_nodejs,
         config_string="https://nodejs.org/dist/v20.11.1/node-v20.11.1-linux-x64.tar.xz",
-    ),
+    )),
 ]
 for callback_key, entrypoint_string in os.environ.items():
     if not callback_key.startswith("LIFESPAN_CALLBACK_"):

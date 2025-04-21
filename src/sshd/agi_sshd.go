@@ -92,10 +92,16 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 	log.Printf("✅ SSH handshake OK — user=%s", serverConn.User())
 	go func() { serverConn.Wait(); cancel() }()
 
+	// handle channels: accept local (-L) and ignore others
 	go func() {
-		for ch := range chans {
-			log.Printf("❌ rejecting channel type=%s", ch.ChannelType())
-			ch.Reject(ssh.UnknownChannelType, "not supported")
+		for newChan := range chans {
+			switch newChan.ChannelType() {
+			case "direct-streamlocal@openssh.com":
+				go handleLocal(newChan)
+			default:
+				log.Printf("❌ rejecting channel type=%s", newChan.ChannelType())
+				newChan.Reject(ssh.UnknownChannelType, "unsupported channel")
+			}
 		}
 	}()
 
@@ -110,6 +116,7 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 	forwards := make(map[string]*forward)
 	var mu sync.Mutex
 	notified := false
+	count := 0
 
 	for req := range reqs {
 		switch req.Type {
@@ -129,7 +136,7 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 
 			mu.Lock()
 			forwards[base] = &forward{listener, localPath, p.SocketPath}
-			count := len(forwards)
+			count = len(forwards)
 			mu.Unlock()
 
 			req.Reply(true, nil)
@@ -162,8 +169,49 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 			}
 		}
 	}
+
 	<-ctx.Done()
 	log.Println("🔒 SSH session closed, cleaning up")
+}
+
+// handleLocal handles direct-streamlocal channels initiated by client (-L)
+// Only supports dialing AGI_SOCK when basename is "agi.sock"; else rejects.
+func handleLocal(newChan ssh.NewChannel) {
+	payload := newChan.ExtraData()
+	var p struct {
+		SocketPath, Reserved string
+		ReservedUint         uint32
+	}
+	ssh.Unmarshal(payload, &p)
+	base := filepath.Base(p.SocketPath)
+	log.Printf("🔗 -L connect request for %s", p.SocketPath)
+	if base != "agi.sock" {
+		log.Printf("❌ unsupported -L socket basename: %s", base)
+		newChan.Reject(ssh.Prohibited, "only agi.sock is supported")
+		return
+	}
+	agi := os.Getenv("AGI_SOCK")
+	if agi == "" {
+		log.Printf("❌ AGI_SOCK not set, cannot forward %s", base)
+		newChan.Reject(ssh.Prohibited, "AGI_SOCK not set")
+		return
+	}
+	ch, reqs, err := newChan.Accept()
+	if err != nil {
+		log.Printf("❌ accept channel: %v", err)
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+
+	target, err := net.Dial("unix", agi)
+	if err != nil {
+		log.Printf("❌ dial AGI_SOCK %s: %v", agi, err)
+		ch.Close()
+		return
+	}
+	log.Printf("🔁 forwarding local AGI socket %s", agi)
+	pipe(target, ch)
+	log.Printf("✅ closed AGI local forward for %s", base)
 }
 
 func acceptLoop(ctx context.Context, listener net.Listener, sc *ssh.ServerConn, remotePath string) {
@@ -180,7 +228,28 @@ func acceptLoop(ctx context.Context, listener net.Listener, sc *ssh.ServerConn, 
 
 func handleConn(ctx context.Context, conn net.Conn, sc *ssh.ServerConn, remotePath string) {
 	defer conn.Close()
+	base := filepath.Base(remotePath)
 	log.Printf("↔ proxying data for %s", remotePath)
+
+	// Special-case AGI socket: forward to local AGI_SOCK
+	if base == "agi.sock" {
+		agi := os.Getenv("AGI_SOCK")
+		if agi == "" {
+			log.Printf("❌ AGI_SOCK not set, cannot forward %s", base)
+			return
+		}
+		log.Printf("🔁 AGI reverse forwarding %s → %s", base, agi)
+		target, err := net.Dial("unix", agi)
+		if err != nil {
+			log.Printf("❌ dial AGI_SOCK %s: %v", agi, err)
+			return
+		}
+		defer target.Close()
+		go io.Copy(target, conn)
+		io.Copy(conn, target)
+		log.Printf("✅ closed AGI proxy for %s", base)
+		return
+	}
 
 	payload := ssh.Marshal(struct {
 		SocketPath string
@@ -245,4 +314,21 @@ func notifyAGI(ctx context.Context, mu *sync.Mutex, forwards map[string]*forward
 	}
 	resp.Body.Close()
 	log.Printf("✅ AGI POST success: %d forwards sent: %v", len(data), data)
+}
+
+// pipe bi-directionally copies for anything implementing io.ReadWriteCloser
+func pipe(a, b io.ReadWriteCloser) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		io.Copy(a, b)
+		a.Close()
+		wg.Done()
+	}()
+	go func() {
+		io.Copy(b, a)
+		b.Close()
+		wg.Done()
+	}()
+	wg.Wait()
 }
