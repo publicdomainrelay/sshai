@@ -33,7 +33,44 @@ jobs:
       - name: build
         run: python -m build
 
+      - name: 'Get latest version from pyproject.toml'
+        id: get-version-from-pyproject
+        shell: python -u {0}
+        run: |
+          import os
+          import json
+          import tomllib
+          import pathlib
+
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              data = tomllib.load(f)
+
+          pyproject_package_version = data["project"]["version"]
+
+          with open(os.environ["GITHUB_OUPUT"], "w+") as output_fileobj:
+              output_fileobj.write(f"version={pyproject_package_version}\n".encode())
+
+      - name: 'Get latest version from PyPi'
+        id: get-version-from-pypi
+        env:
+          ORG_REPO: '${{ github.repository }}'
+        shell: python -u {0}
+        run: |
+          import os
+          import json
+          import urllib.request
+          repo_name = os.environ["ORG_REPO"]
+          url = f"https://pypi.org/pypi/${GITHUB_REPOSITORY}/json"
+          with urllib.request.urlopen(url) as response:
+              package_json = json.loads(response.read())
+          pypi_latest_package_version = package_json["info"]["version"]
+          with open(os.environ["GITHUB_OUPUT"], "w+") as output_fileobj:
+              output_fileobj.write(f"published-version={pypi_latest_package_version}\n".encode())
+
       - name: Publish package distributions to PyPI
+        if: ${{ steps.get-version-from-pypi.outputs.published-version != steps.get-version-from-pyproject.outputs.version }}
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           verify-metadata: false

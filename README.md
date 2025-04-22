@@ -10,7 +10,11 @@ export SSH_CALLER_PATH=$(mktemp -d); export AGI_SOCK="${SSH_CALLER_PATH}/agi.soc
 ## Hosting
 
 ```bash
-pip install sshai
+# Temporary branch installs present until pending PRs close
+pip install sshai \
+    "mcp-proxy@git+https://github.com/johnandersen777/mcp-proxy@mcp_enable_over_unix_socket" \
+    "mcp@git+https://github.com/johnandersen777/python-sdk@mcp_enable_over_unix_socket" \
+    "openai-agents@git+https://github.com/johnandersen777/openai-agents-python@additional_properties_dict_keys_mcp_enable_over_unix_socket"
 
 export OPENAI_API_KEY=AAA
 sshai --uds /tmp/agi.sock
