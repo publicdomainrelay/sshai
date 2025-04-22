@@ -111,9 +111,12 @@ fi
 
 export ${AGI_NAME}_POLICY_ENGINE_SOCK="${!agi_sock_dir}/policy-engine.sock"
 export agi_policy_engine_sock="${AGI_NAME}_POLICY_ENGINE_SOCK"
-NO_CELERY=1 python -u ${CALLER_PATH}/policy_engine.py api --bind "unix:${!agi_policy_engine_sock}" --workers 1 1>"${CALLER_PATH}/policy_engine.logs.txt" 2>&1 &
+DEBUG=1 NO_CELERY=1 python -u ${CALLER_PATH}/policy_engine.py api --bind "unix:${!agi_policy_engine_sock}" --workers 1 1>"${CALLER_PATH}/policy_engine.logs.txt" 2>&1 &
 POLICY_ENGINE_PID=$!
 PIDs+=("${POLICY_ENGINE_PID}")
+until [ -S "${!agi_policy_engine_sock}" ]; do
+  sleep 0.01
+done
 
 submit_policy_engine_request
 

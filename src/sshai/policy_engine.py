@@ -1031,7 +1031,11 @@ def step_io_update_stack_output_and_env_github_actions(context, request, step):
 
 def step_parse_annotations_github_actions_line(context, step, line):
     line = line.strip().strip("::")
-    annotation_level, message = line.split("::", maxsplit=1)
+    annotation_split = line.split("::", maxsplit=1)
+    annotation_level = annotation_split[0]
+    message = ""
+    if len(annotation_split) == 2:
+        message = annotation_split[1]
     details = {
         "title": message,
         "message": message,

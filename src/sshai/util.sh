@@ -17,13 +17,25 @@ check_policy_engine_request() {
     curl --unix-socket "${!agi_policy_engine_sock}" -sfL http://localhost/request/status/$POLICY_ENGINE_TASK_ID | jq
 }
 
+check_error_policy_engine_request() {
+    local agi_policy_engine_sock="${AGI_NAME}_POLICY_ENGINE_SOCK"
+    curl --unix-socket "${!agi_policy_engine_sock}" -sfL http://localhost/request/status/$POLICY_ENGINE_TASK_ID | jq -r .detail.annotations.error[0]
+}
+
+console_output_policy_engine_request() {
+    local agi_policy_engine_sock="${AGI_NAME}_POLICY_ENGINE_SOCK"
+    curl --unix-socket "${!agi_policy_engine_sock}" -sfL http://localhost/request/console_output/$POLICY_ENGINE_TASK_ID
+}
+
 submit_policy_engine_request() {
     tail -F "${CALLER_PATH}/policy_engine.logs.txt" &
     TAIL_PID=$!
 
+    local policy_engine_pid=0
     local agi_policy_engine_sock="${AGI_NAME}_POLICY_ENGINE_SOCK"
-    if ! [ -S "${!agi_policy_engine_sock}" ]; then
-      NO_CELERY=1 python -u ${CALLER_PATH}/policy_engine.py api --bind "unix:${!agi_policy_engine_sock}" --workers 1 1>"${CALLER_PATH}/policy_engine.logs.txt" 2>&1 &
+    if [ ! -S "${!agi_policy_engine_sock}" ]; then
+      DEBUG=1 NO_CELERY=1 python -u ${CALLER_PATH}/policy_engine.py api --bind "unix:${!agi_policy_engine_sock}" --workers 1 1>"${CALLER_PATH}/policy_engine.logs.txt" 2>&1 &
+      policy_engine_pid=$!
     fi
     until [ -S "${!agi_policy_engine_sock}" ]; do
       sleep 0.01
@@ -40,6 +52,10 @@ submit_policy_engine_request() {
     STATUS=$(curl --unix-socket "${!agi_policy_engine_sock}" -sfL http://localhost/request/status/$POLICY_ENGINE_TASK_ID | python -m json.tool > "${CALLER_PATH}/last-request-status.json")
     cat "${CALLER_PATH}/last-request-status.json" | jq
     export STATUS=$(cat "${CALLER_PATH}/last-request-status.json" | jq -r .status)
+
+    if [ "x${policy_engine_pid}" != "x0" ]; then
+        kill "${policy_engine_pid}"
+    fi
 }
 
 policy_engine_deps() {
