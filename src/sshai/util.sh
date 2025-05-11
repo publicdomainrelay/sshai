@@ -59,12 +59,18 @@ submit_policy_engine_request() {
 }
 
 policy_engine_deps() {
+  if [ ! -f "${CALLER_PATH}/.venv/bin/activate" ]; then
+    python -m venv "${CALLER_PATH}/.venv"
+  fi
+  OLD_PS1="${PS1}"
+  source "${CALLER_PATH}/.venv/bin/activate"
+  export PS1="${OLD_PS1}"
   python -m pip install -U pip setuptools wheel build
   python -m pip install -U pyyaml snoop pytest httpx cachetools aiohttp gidgethub[aiohttp] celery[redis] fastapi pydantic gunicorn uvicorn
 
   # Other deps
   # - Formatting output as markdown for CLI
-  python -m pip install -U rich
+  python -m pip install -U rich uv
 
   # MCP deps
   python -m pip install -U \

@@ -20,13 +20,22 @@ RUN set -x \
   && python -m tarfile -l dist/*.tar.*
 
 # Python server, add built golang server
-FROM registry.fedoraproject.org/fedora AS client
+FROM python:3.12 AS server
+
+RUN set -x \
+  && apt-get update \
+  && apt-get install -y tmux \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/app/dist/*.whl /tmp/install-wheels/
 
 ENV CALLER_PATH=/host
 
 RUN set -x \
-  && pip install /tmp/install-wheels/*.whl
+  && mkdir -pv $CALLER_PATH \
+  && pip install /tmp/install-wheels/*.whl \
+    "mcp-proxy@git+https://github.com/johnandersen777/mcp-proxy@mcp_enable_over_unix_socket" \
+    "mcp@git+https://github.com/johnandersen777/python-sdk@mcp_enable_over_unix_socket" \
+    "openai-agents@git+https://github.com/johnandersen777/openai-agents-python@additional_properties_dict_keys_mcp_enable_over_unix_socket"
 
 ENTRYPOINT ["python", "-m", "sshai", "--uds", "/host/agi.sock"]

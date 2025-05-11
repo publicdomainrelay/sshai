@@ -3701,7 +3701,11 @@ async def execute_generated_workflow(
             json.loads(
                 PolicyEngineRequest(
                     inputs={},
-                    context={},
+                    context={
+                        "config": {
+                            "cwd": str(tempdir),
+                        },
+                    },
                     stack={},
                     workflow=workflow,
                 ).model_dump_json(),
@@ -5212,7 +5216,7 @@ async def tmux_test(
             f'curl -s --unix-socket ${agi_name.upper()}_AGI_SOCK' + r' -fLo "${bootstrap}/setup.sh" http://localhost/files/setup.sh',
             enter=True,
         )
-        pane.send_keys('export AGI_DEBUG=1', enter=True)
+        # pane.send_keys('export AGI_DEBUG=1', enter=True)
         pane.send_keys('. "${bootstrap}/setup.sh"', enter=True)
 
         # pane.send_keys('set -x', enter=True)

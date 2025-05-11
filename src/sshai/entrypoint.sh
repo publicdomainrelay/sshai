@@ -24,10 +24,10 @@ fi
 
 if [[ ! -f /usr/bin/socat ]] || [[ ! -f /usr/bin/git ]] || [[ ! -f /usr/bin/tmux ]] || [[ ! -f /usr/bin/ssh ]] || [[ ! -f /usr/bin/python ]] || [[ ! -f /usr/bin/unzip ]] || [[ ! -f /usr/bin/curl ]] || [[ ! -f /usr/bin/node ]]; then
   if [[ "x${ID}" = "xfedora" ]]; then
-    $SUDO dnf install -y tmux git vim curl openssh socat jq python python-pip unzip nodejs
+    $SUDO dnf install -y tmux git vim curl openssh socat jq python python-pip python-venv unzip nodejs
   fi
   if [[ "x${ID}" = "xdebian" ]] || [[ "x${ID_LIKE}" = "xdebian" ]]; then
-    $SUDO apt-get update && $SUDO apt-get install -y tmux git vim curl openssh-client socat jq python3 python3-pip unzip nodejs
+    $SUDO apt-get update && $SUDO apt-get install -y tmux git vim curl openssh-client socat jq python3 python3-pip python3-venv unzip nodejs python-is-python3
   fi
 fi
 
@@ -53,6 +53,12 @@ if [ ! -f /usr/bin/caddy ]; then
 fi
 
 policy_engine_deps() {
+  if [ ! -f "${CALLER_PATH}/.venv/bin/activate" ]; then
+    python -m venv "${CALLER_PATH}/.venv"
+  fi
+  OLD_PS1="${PS1}"
+  source "${CALLER_PATH}/.venv/bin/activate"
+  export PS1="${OLD_PS1}"
   python -m pip install -U pip setuptools wheel build
   python -m pip install -U pyyaml snoop pytest httpx cachetools aiohttp gidgethub[aiohttp] celery[redis] fastapi pydantic gunicorn uvicorn
 }

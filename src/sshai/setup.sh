@@ -67,10 +67,6 @@ cat > "${CALLER_PATH}/entrypoint.sh" <<WRITE_OUT_SH_EOF
 #!/usr/bin/env bash
 set -uo pipefail
 
-if [ "x\${AGI_DEBUG}" != "x" ]; then
-  set -x
-fi
-
 # trap bash EXIT
 
 if [ "x\$CALLER_PATH" = "x" ]; then
@@ -82,9 +78,11 @@ curl -s --unix-socket "${!agi_sock}" -fL http://localhost/files/entrypoint.sh >>
 
 chmod 700 "${CALLER_PATH}/entrypoint.sh"
 
-cat > "${CALLER_PATH}/request.yml" <<'WRITE_OUT_SH_EOF'
+cat > "${CALLER_PATH}/request.yml" <<WRITE_OUT_SH_EOF
 context:
   secrets: {}
+  config:
+    cwd: "${CALLER_PATH}"
 inputs: {}
 stack: {}
 workflow:
@@ -107,6 +105,12 @@ source "${CALLER_PATH}/util.sh"
 
 if [ ! -f "${CALLER_PATH}/policy_engine.logs.txt" ]; then
     policy_engine_deps
+fi
+
+if [ -f "${CALLER_PATH}/.venv/bin/activate" ]; then
+  OLD_PS1="${PS1}"
+  source "${CALLER_PATH}/.venv/bin/activate"
+  export PS1="${OLD_PS1}"
 fi
 
 export ${AGI_NAME}_POLICY_ENGINE_SOCK="${!agi_sock_dir}/policy-engine.sock"
@@ -177,9 +181,14 @@ PIDs+=("${INPUT_SOCK_PID}")
 ls -lAF "${!agi_input_sock}"
 
 # if [ ! -f "${CALLER_PATH}/caddy.logs.txt" ]; then
+export agi_mcp_reverse_proxy_sock="${AGI_NAME}_MCP_REVERSE_PROXY_SOCK"
+export ${AGI_NAME}_MCP_REVERSE_PROXY_SOCK="${!agi_sock_dir}/mcp-reverse-proxy.sock"
 HOME=${CALLER_PATH} caddy run --config ${CALLER_PATH}/Caddyfile 1>"${CALLER_PATH}/caddy.logs.txt" 2>&1 &
 CADDY_PID=$!
 PIDs+=("${CADDY_PID}")
+until [ -S "${!agi_mcp_reverse_proxy_sock}" ]; do
+  sleep 0.01
+done
 
 # cd ${CALLER_PATH}
 # npm install @wonderwhy-er/desktop-commander@latest
@@ -187,11 +196,18 @@ PIDs+=("${CADDY_PID}")
 python -um mcp_proxy --sse-uds "${!agi_sock_dir}/desktopcommander.sock" -- uvx mcp-server-fetch 1>"${CALLER_PATH}/mcp_server_desktopcommander.logs.txt" 2>&1 &
 MCP_SERVER_DESKTOPCOMMANDER_PID=$!
 PIDs+=("${MCP_SERVER_DESKTOPCOMMANDER_PID}")
+until [ -S "${!agi_sock_dir}/desktopcommander.sock" ]; do
+  sleep 0.01
+done
 
 python -u ${CALLER_PATH}/mcp_server_files.py --transport sse --uds "${!agi_sock_dir}/files.sock" 1>"${CALLER_PATH}/mcp_server_files.logs.txt" 2>&1 &
 MCP_SERVER_FILES_PID=$!
 PIDs+=("${MCP_SERVER_FILES_PID}")
+until [ -S "${!agi_sock_dir}/files.sock" ]; do
+  sleep 0.01
+done
 
+set +u
 if [ "x${AGI_DEBUG}" != "x" ]; then
   set +x
 fi
