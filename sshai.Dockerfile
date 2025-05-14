@@ -24,7 +24,8 @@ FROM python:3.12 AS server
 
 RUN set -x \
   && apt-get update \
-  && apt-get install -y tmux \
+  && apt-get install -y \
+       tmux \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/app/dist/*.whl /tmp/install-wheels/
@@ -38,4 +39,4 @@ RUN set -x \
     "mcp@git+https://github.com/johnandersen777/python-sdk@mcp_enable_over_unix_socket" \
     "openai-agents@git+https://github.com/johnandersen777/openai-agents-python@additional_properties_dict_keys_mcp_enable_over_unix_socket"
 
-ENTRYPOINT ["python", "-m", "sshai", "--uds", "/host/agi.sock"]
+ENTRYPOINT ["python", "-u", "-m", "sshai", "--uds", "/host/agi.sock"]
