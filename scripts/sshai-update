@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -exuo pipefail
+
+SUDO=""
+if [[ -f /usr/bin/sudo ]]; then
+  SUDO="sudo -E"
+fi
+
+if [ ! -f /usr/bin/sshai-update ]; then
+  $SUDO cp -v "${0}" /usr/bin/sshai-update
+fi
+
+cd ~/sshai
+git pull
+docker build --progress=plain -t sshai -f sshai.Dockerfile .
+
+set +e
+docker kill sshai
+docker rm sshai
+set -e
+
+docker run --name sshai -d -p 2222:2222 -e OPENAI_API_KEY=$(python -m keyring get $(git config user.email) api-key.platform.openai.com) sshai
+
+docker logs -f sshai
