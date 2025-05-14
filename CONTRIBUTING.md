@@ -6,6 +6,7 @@
 pip install -U \
     pre-commit \
     pip \
+    keyring \
     setuptools \
     wheel
 pip install -e .

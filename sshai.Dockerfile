@@ -16,6 +16,7 @@ WORKDIR /usr/src/app
 COPY . /usr/src/app
 
 RUN set -x \
+  && rm -rf dist/ \
   && python -m build . \
   && python -m tarfile -l dist/*.tar.*
 
