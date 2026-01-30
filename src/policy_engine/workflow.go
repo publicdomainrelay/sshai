@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"text/template"
 
@@ -738,11 +739,26 @@ func (e *WorkflowExecutor) parseAnnotations(output string) {
 		// Parse parameters if present
 		if len(levelParts) > 1 {
 			params, _ := url.ParseQuery(strings.ReplaceAll(levelParts[1], ",", "&"))
+			// GitHub Actions uses 'file' for the path
+			if file := params.Get("file"); file != "" {
+				annotation.Path = file
+			}
 			if path := params.Get("path"); path != "" {
 				annotation.Path = path
 			}
 			if title := params.Get("title"); title != "" {
 				annotation.Title = title
+			}
+			if line := params.Get("line"); line != "" {
+				if lineNum, err := strconv.Atoi(line); err == nil {
+					annotation.StartLine = lineNum
+					annotation.EndLine = lineNum
+				}
+			}
+			if endLine := params.Get("endLine"); endLine != "" {
+				if lineNum, err := strconv.Atoi(endLine); err == nil {
+					annotation.EndLine = lineNum
+				}
 			}
 		}
 
