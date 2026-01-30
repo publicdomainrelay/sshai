@@ -1,5 +1,6 @@
 dist/
 src/sshai/agi_sshd
 src/sshd/agi_sshd
+src/policy_engine/policy_engine
 __pycache__/
 src/sshai/workflow.schema.json
