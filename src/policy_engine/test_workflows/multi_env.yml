@@ -1,0 +1,33 @@
+name: Multi-Environment Workflow
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+      version:
+        description: 'Version to deploy'
+        required: false
+        default: ''
+
+jobs:
+  test:
+    if: inputs.environment == 'staging'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Run integration tests
+      run: |
+        echo "Testing for ${{ inputs.environment }}"
+        echo "Version: ${{ inputs.version }}"
+        
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+    - name: Deploy to ${{ inputs.environment }}
+      run: |
+        echo "Deploying to ${{ inputs.environment }}"
+        if [ "${{ inputs.version }}" != "" ]; then
+          echo "Deploying version ${{ inputs.version }}"
+        fi

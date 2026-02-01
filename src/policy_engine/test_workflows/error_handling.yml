@@ -1,0 +1,31 @@
+name: Error Handling Workflow
+on: push
+
+jobs:
+  error-test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Step that succeeds
+      run: echo "This step will succeed"
+      
+    - name: Step that fails
+      run: |
+        echo "::error file=app.js,line=42::Syntax error"
+        exit 1
+        
+    - name: Step that creates warnings
+      run: |
+        echo "::warning::Deprecated function used"
+        echo "::notice title=Info::This is a notice"
+        
+  continue-on-error:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+    - name: This might fail
+      run: |
+        echo "This step is allowed to fail"
+        exit 1
+        
+    - name: This still runs
+      run: echo "This runs even if previous step failed"

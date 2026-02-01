@@ -1,2 +1,4 @@
 .tempdir/
 .cache/
+*.exe
+*.out
