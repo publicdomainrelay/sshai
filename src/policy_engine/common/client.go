@@ -1,4 +1,4 @@
-package main
+package common
 
 import (
 	"bytes"
@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -21,14 +23,43 @@ type Client struct {
 }
 
 // NewClient creates a new policy engine client.
+// The endpoint can be an HTTP URL (http://host:port) or a Unix socket
+// path prefixed with "unix:" or "unix://", e.g. "unix:///tmp/pe.sock"
+// or "unix:/tmp/pe.sock".
 func NewClient(endpoint string, timeout time.Duration) *Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+
+	// Normalise the endpoint for unix sockets.
+	resolvedEndpoint := endpoint
+	if sockPath, ok := parseUnixEndpoint(endpoint); ok {
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return net.DialTimeout("unix", sockPath, timeout)
+		}
+		// When using a unix socket the HTTP host is irrelevant; use a
+		// placeholder so http.Client builds valid URLs.
+		resolvedEndpoint = "http://localhost"
+	}
+
 	return &Client{
-		endpoint: endpoint,
+		endpoint: resolvedEndpoint,
 		httpClient: &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: transport,
 		},
 		timeout: timeout,
 	}
+}
+
+// parseUnixEndpoint returns the socket path if endpoint is a unix socket
+// reference ("unix:///path", "unix:/path"), and false otherwise.
+func parseUnixEndpoint(endpoint string) (string, bool) {
+	if strings.HasPrefix(endpoint, "unix://") {
+		return strings.TrimPrefix(endpoint, "unix://"), true
+	}
+	if strings.HasPrefix(endpoint, "unix:") {
+		return strings.TrimPrefix(endpoint, "unix:"), true
+	}
+	return "", false
 }
 
 // CreateRequest sends a workflow execution request to the policy engine.
@@ -123,6 +154,64 @@ func (c *Client) GetConsoleOutput(ctx context.Context, taskID string) (string, e
 	}
 
 	return string(body), nil
+}
+
+// StreamConsoleOutput streams console output from the SSE endpoint to the given writer.
+func (c *Client) StreamConsoleOutput(ctx context.Context, taskID string, w io.Writer) error {
+	url := fmt.Sprintf("%s/request/console_output_stream/%s", c.endpoint, taskID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+	httpReq.Header.Set("Accept", "text/event-stream")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Read SSE stream
+	buf := make([]byte, 0, 4096)
+	tmp := make([]byte, 4096)
+	for {
+		n, readErr := resp.Body.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			// Process complete SSE messages
+			for {
+				idx := bytes.Index(buf, []byte("\n\n"))
+				if idx < 0 {
+					break
+				}
+				message := string(buf[:idx])
+				buf = buf[idx+2:]
+
+				// Parse SSE message
+				for _, line := range strings.Split(message, "\n") {
+					if strings.HasPrefix(line, "event: done") {
+						return nil
+					}
+					if strings.HasPrefix(line, "data: ") {
+						data := strings.TrimPrefix(line, "data: ")
+						fmt.Fprintln(w, data)
+					}
+					// Ignore comments (keepalive)
+				}
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil
+			}
+			return readErr
+		}
+	}
 }
 
 // WaitForCompletion polls for status until the task is complete.

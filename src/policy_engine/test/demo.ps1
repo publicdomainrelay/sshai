@@ -12,7 +12,7 @@ Write-Host "====================" -ForegroundColor Cyan
 # Check if policy engine binary exists
 if (-not (Test-Path $PolicyEngine)) {
     Write-Host "❌ Policy engine binary not found. Building..." -ForegroundColor Red
-    go build -o policy_engine.exe main.go
+    go build -o policy_engine.exe ./cmd/policy-engine/
     if ($LASTEXITCODE -ne 0) {
         Write-Host "❌ Failed to build policy engine" -ForegroundColor Red
         exit 1

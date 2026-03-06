@@ -1,7 +1,8 @@
-package main
+package common
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -155,6 +156,8 @@ func TestBuildStepEnv(t *testing.T) {
 	executor.Context.Env["EXISTING_VAR"] = "existing_value"
 	executor.Context.Workspace = "/tmp/workspace"
 	executor.Context.TempDir = "/tmp/temp"
+	executor.Context.ToolCacheDir = "/tmp/toolcache"
+	executor.Context.HomeDir = "/tmp/fakehome"
 
 	step := &PolicyEngineWorkflowJobStep{
 		Env: map[string]interface{}{
@@ -178,6 +181,15 @@ func TestBuildStepEnv(t *testing.T) {
 	}
 	if env["GITHUB_WORKSPACE"] != "/tmp/workspace" {
 		t.Errorf("expected GITHUB_WORKSPACE=/tmp/workspace, got %s", env["GITHUB_WORKSPACE"])
+	}
+	if env["RUNNER_TOOL_CACHE"] != "/tmp/toolcache" {
+		t.Errorf("expected RUNNER_TOOL_CACHE=/tmp/toolcache, got %s", env["RUNNER_TOOL_CACHE"])
+	}
+	if env["AGENT_TOOLSDIRECTORY"] != "/tmp/toolcache" {
+		t.Errorf("expected AGENT_TOOLSDIRECTORY=/tmp/toolcache, got %s", env["AGENT_TOOLSDIRECTORY"])
+	}
+	if env["HOME"] != "/tmp/fakehome" {
+		t.Errorf("expected HOME=/tmp/fakehome, got %s", env["HOME"])
 	}
 }
 
@@ -500,6 +512,146 @@ jobs:
 	}
 }
 
+func TestExecuteWorkflowBetweenStepOutputPassing(t *testing.T) {
+	// Skip if bash is not available
+	if _, err := os.Stat("/bin/bash"); os.IsNotExist(err) {
+		t.Skip("bash not available")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	executor := NewWorkflowExecutor()
+
+	// Step 1 writes multiple outputs via GITHUB_OUTPUT file,
+	// Step 2 reads them via ${{ steps.producer.outputs.* }} expressions.
+	request := &PolicyEngineRequest{
+		Inputs: map[string]interface{}{
+			"greeting": "hello",
+		},
+		Workflow: `
+name: Between Step Output Passing Test
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - id: producer
+      env:
+        MSG: "${{ inputs.greeting }}"
+      run: |
+        echo "message=$MSG" >> $GITHUB_OUTPUT
+        echo "count=42" >> $GITHUB_OUTPUT
+    - id: consumer
+      env:
+        RECEIVED_MSG: "${{ steps.producer.outputs.message }}"
+        RECEIVED_COUNT: "${{ steps.producer.outputs.count }}"
+      run: |
+        echo "GOT_MSG=$RECEIVED_MSG"
+        echo "GOT_COUNT=$RECEIVED_COUNT"
+`,
+		Context: map[string]interface{}{
+			"config": map[string]interface{}{
+				"env": map[string]interface{}{
+					"GITHUB_REPOSITORY": "test/repo",
+				},
+			},
+		},
+	}
+
+	status, err := executor.ExecuteWorkflow(ctx, request)
+	if err != nil {
+		t.Fatalf("workflow execution failed: %v", err)
+	}
+
+	if status.Status != StatusComplete {
+		t.Errorf("expected status complete, got %s", status.Status)
+	}
+
+	detail, ok := status.Detail.(PolicyEngineComplete)
+	if !ok {
+		t.Fatal("expected PolicyEngineComplete detail")
+	}
+
+	if detail.ExitStatus != ExitStatusSuccess {
+		t.Errorf("expected exit status success, got %s", detail.ExitStatus)
+	}
+
+	// Verify step 1 outputs were captured
+	if executor.Context.Outputs["producer"] == nil {
+		t.Fatal("expected producer outputs to be captured")
+	}
+	producerOutputs, ok := executor.Context.Outputs["producer"]["outputs"].(map[string]string)
+	if !ok {
+		t.Fatalf("expected producer outputs to be map[string]string, got %T", executor.Context.Outputs["producer"]["outputs"])
+	}
+	if producerOutputs["message"] != "hello" {
+		t.Errorf("expected producer output message=hello, got %s", producerOutputs["message"])
+	}
+	if producerOutputs["count"] != "42" {
+		t.Errorf("expected producer output count=42, got %s", producerOutputs["count"])
+	}
+
+	// Verify step 2 received the outputs from step 1
+	if !strings.Contains(status.ConsoleOutput, "GOT_MSG=hello") {
+		t.Errorf("expected output to contain 'GOT_MSG=hello', got: %s", status.ConsoleOutput)
+	}
+	if !strings.Contains(status.ConsoleOutput, "GOT_COUNT=42") {
+		t.Errorf("expected output to contain 'GOT_COUNT=42', got: %s", status.ConsoleOutput)
+	}
+}
+
+func TestExecuteWorkflowWithGitHubEnvBetweenSteps(t *testing.T) {
+	// Skip if bash is not available
+	if _, err := os.Stat("/bin/bash"); os.IsNotExist(err) {
+		t.Skip("bash not available")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	executor := NewWorkflowExecutor()
+
+	// Step 1 writes to GITHUB_ENV, Step 2 should see the new env var.
+	request := &PolicyEngineRequest{
+		Workflow: `
+name: GITHUB_ENV Between Steps Test
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - id: set-env
+      run: echo "DYNAMIC_VAR=from_step1" >> $GITHUB_ENV
+    - run: echo "DYNAMIC_VAR=$DYNAMIC_VAR"
+`,
+		Context: map[string]interface{}{
+			"config": map[string]interface{}{
+				"env": map[string]interface{}{
+					"GITHUB_REPOSITORY": "test/repo",
+				},
+			},
+		},
+	}
+
+	status, err := executor.ExecuteWorkflow(ctx, request)
+	if err != nil {
+		t.Fatalf("workflow execution failed: %v", err)
+	}
+
+	if status.Status != StatusComplete {
+		t.Errorf("expected status complete, got %s", status.Status)
+	}
+
+	// Verify GITHUB_ENV was parsed and applied to the execution context
+	if executor.Context.Env["DYNAMIC_VAR"] != "from_step1" {
+		t.Errorf("expected DYNAMIC_VAR=from_step1 in context env, got %v", executor.Context.Env["DYNAMIC_VAR"])
+	}
+
+	// Verify step 2 saw the env var propagated
+	if !strings.Contains(status.ConsoleOutput, "DYNAMIC_VAR=from_step1") {
+		t.Errorf("expected output to contain 'DYNAMIC_VAR=from_step1', got: %s", status.ConsoleOutput)
+	}
+}
+
 func TestExecuteWorkflowWithEnv(t *testing.T) {
 	// Skip if bash is not available
 	if _, err := os.Stat("/bin/bash"); os.IsNotExist(err) {
@@ -702,9 +854,23 @@ func TestInitializeContext(t *testing.T) {
 		t.Error("expected workspace to be set")
 	}
 
+	if executor.Context.ToolCacheDir == "" {
+		t.Error("expected tool cache dir to be set")
+	}
+
+	if executor.Context.HomeDir == "" {
+		t.Error("expected home dir to be set")
+	}
+
 	// Cleanup
 	if executor.Context.Workspace != "" {
 		os.RemoveAll(executor.Context.Workspace)
+	}
+	if executor.Context.ToolCacheDir != "" {
+		os.RemoveAll(executor.Context.ToolCacheDir)
+	}
+	if executor.Context.HomeDir != "" {
+		os.RemoveAll(executor.Context.HomeDir)
 	}
 }
 
@@ -871,5 +1037,353 @@ func TestUnzipFunction(t *testing.T) {
 
 	if string(content) != "test content" {
 		t.Errorf("expected 'test content', got %s", string(content))
+	}
+}
+
+func TestExecuteCompositeActionViaLocalPath(t *testing.T) {
+	// Skip if bash is not available
+	if _, err := os.Stat("/bin/bash"); os.IsNotExist(err) {
+		t.Skip("bash not available")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	executor := NewWorkflowExecutor()
+
+	// Get absolute path to our test composite action fixture
+	testActionDir, err := filepath.Abs("../test/workflows/local-composite-action")
+	if err != nil {
+		t.Fatalf("failed to get absolute path: %v", err)
+	}
+
+	// Use the test fixture via absolute path
+	request := &PolicyEngineRequest{
+		Workflow: fmt.Sprintf(`
+name: Local Composite Action Test
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: %s
+      with:
+        greeting: Hi
+        name: Tester
+    - run: echo "AFTER_COMPOSITE=yes"
+`, testActionDir),
+		Context: map[string]interface{}{
+			"config": map[string]interface{}{
+				"env": map[string]interface{}{
+					"GITHUB_REPOSITORY": "test/repo",
+				},
+			},
+		},
+	}
+
+	status, err := executor.ExecuteWorkflow(ctx, request)
+	if err != nil {
+		t.Fatalf("workflow execution failed: %v", err)
+	}
+
+	if status.Status != StatusComplete {
+		t.Errorf("expected status complete, got %s", status.Status)
+	}
+
+	detail, ok := status.Detail.(PolicyEngineComplete)
+	if !ok {
+		t.Fatal("expected PolicyEngineComplete detail")
+	}
+
+	if detail.ExitStatus != ExitStatusSuccess {
+		t.Errorf("expected exit status success, got %s\nconsole output:\n%s", detail.ExitStatus, status.ConsoleOutput)
+	}
+
+	// Verify composite action steps ran with the provided inputs
+	if !strings.Contains(status.ConsoleOutput, "COMPOSITE_GREETING=Hi Tester") {
+		t.Errorf("expected 'COMPOSITE_GREETING=Hi Tester' in output, got:\n%s", status.ConsoleOutput)
+	}
+	if !strings.Contains(status.ConsoleOutput, "COMPOSITE_ACTION_PATH=") {
+		t.Errorf("expected COMPOSITE_ACTION_PATH to be set, got:\n%s", status.ConsoleOutput)
+	}
+	if !strings.Contains(status.ConsoleOutput, "COMPOSITE_STEP_THREE=done") {
+		t.Errorf("expected 'COMPOSITE_STEP_THREE=done' in output, got:\n%s", status.ConsoleOutput)
+	}
+	// Verify the step after the composite action also ran
+	if !strings.Contains(status.ConsoleOutput, "AFTER_COMPOSITE=yes") {
+		t.Errorf("expected 'AFTER_COMPOSITE=yes' in output, got:\n%s", status.ConsoleOutput)
+	}
+}
+
+func TestExecuteCompositeActionDirect(t *testing.T) {
+	// Skip if bash is not available
+	if _, err := os.Stat("/bin/bash"); os.IsNotExist(err) {
+		t.Skip("bash not available")
+	}
+
+	// This test exercises the executeCompositeAction code path directly
+	// by creating a workflow that uses a local composite action.
+	// We set up the workspace to contain the action directory ourselves.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	executor := NewWorkflowExecutor()
+
+	// Create a temp workspace
+	tmpDir, err := os.MkdirTemp("", "composite-direct-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create local composite action inside workspace
+	actionDir := filepath.Join(tmpDir, "my-composite")
+	if err := os.MkdirAll(actionDir, 0755); err != nil {
+		t.Fatalf("failed to create action dir: %v", err)
+	}
+	actionYml := `name: 'Test Composite'
+description: 'Test composite action'
+inputs:
+  message:
+    description: 'Message to echo'
+    default: 'default-msg'
+runs:
+  using: 'composite'
+  steps:
+    - run: echo "COMPOSITE_MSG=$INPUT_MESSAGE"
+      shell: bash
+    - run: echo "COMPOSITE_SECOND_STEP=executed"
+      shell: bash
+`
+	if err := os.WriteFile(filepath.Join(actionDir, "action.yml"), []byte(actionYml), 0644); err != nil {
+		t.Fatalf("failed to write action.yml: %v", err)
+	}
+
+	// Use absolute path to the local action
+	request := &PolicyEngineRequest{
+		Workflow: fmt.Sprintf(`
+name: Direct Composite Test
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: %s
+      with:
+        message: hello-composite
+    - run: echo "POST_COMPOSITE=success"
+`, actionDir),
+		Context: map[string]interface{}{
+			"config": map[string]interface{}{
+				"env": map[string]interface{}{
+					"GITHUB_REPOSITORY": "test/repo",
+				},
+			},
+		},
+	}
+
+	status, err := executor.ExecuteWorkflow(ctx, request)
+	if err != nil {
+		t.Fatalf("workflow execution failed: %v", err)
+	}
+
+	if status.Status != StatusComplete {
+		t.Errorf("expected status complete, got %s", status.Status)
+	}
+
+	detail, ok := status.Detail.(PolicyEngineComplete)
+	if !ok {
+		t.Fatal("expected PolicyEngineComplete detail")
+	}
+
+	if detail.ExitStatus != ExitStatusSuccess {
+		t.Errorf("expected exit status success, got %s\nconsole output:\n%s", detail.ExitStatus, status.ConsoleOutput)
+	}
+
+	// Verify composite action steps ran
+	if !strings.Contains(status.ConsoleOutput, "COMPOSITE_MSG=hello-composite") {
+		t.Errorf("expected composite action to echo message, got:\n%s", status.ConsoleOutput)
+	}
+	if !strings.Contains(status.ConsoleOutput, "COMPOSITE_SECOND_STEP=executed") {
+		t.Errorf("expected composite action second step to run, got:\n%s", status.ConsoleOutput)
+	}
+	// Verify step after composite also ran
+	if !strings.Contains(status.ConsoleOutput, "POST_COMPOSITE=success") {
+		t.Errorf("expected post-composite step to run, got:\n%s", status.ConsoleOutput)
+	}
+}
+
+func TestExecuteCompositeActionWithDefaults(t *testing.T) {
+	// Skip if bash is not available
+	if _, err := os.Stat("/bin/bash"); os.IsNotExist(err) {
+		t.Skip("bash not available")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	executor := NewWorkflowExecutor()
+
+	// Create a temp workspace with a local composite action
+	tmpDir, err := os.MkdirTemp("", "composite-defaults-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	actionDir := filepath.Join(tmpDir, "default-action")
+	if err := os.MkdirAll(actionDir, 0755); err != nil {
+		t.Fatalf("failed to create action dir: %v", err)
+	}
+	actionYml := `name: 'Default Inputs Composite'
+description: 'Tests default input handling in composite actions'
+inputs:
+  color:
+    description: 'A color'
+    default: 'blue'
+  size:
+    description: 'A size'
+    default: 'medium'
+runs:
+  using: 'composite'
+  steps:
+    - run: echo "COLOR=$INPUT_COLOR SIZE=$INPUT_SIZE"
+      shell: bash
+`
+	if err := os.WriteFile(filepath.Join(actionDir, "action.yml"), []byte(actionYml), 0644); err != nil {
+		t.Fatalf("failed to write action.yml: %v", err)
+	}
+
+	// Don't provide any inputs - defaults should be used
+	request := &PolicyEngineRequest{
+		Workflow: fmt.Sprintf(`
+name: Composite Defaults Test
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: %s
+    - uses: %s
+      with:
+        color: red
+`, actionDir, actionDir),
+		Context: map[string]interface{}{
+			"config": map[string]interface{}{
+				"env": map[string]interface{}{
+					"GITHUB_REPOSITORY": "test/repo",
+				},
+			},
+		},
+	}
+
+	status, err := executor.ExecuteWorkflow(ctx, request)
+	if err != nil {
+		t.Fatalf("workflow execution failed: %v", err)
+	}
+
+	if status.Status != StatusComplete {
+		t.Errorf("expected status complete, got %s", status.Status)
+	}
+
+	detail, ok := status.Detail.(PolicyEngineComplete)
+	if !ok {
+		t.Fatal("expected PolicyEngineComplete detail")
+	}
+
+	if detail.ExitStatus != ExitStatusSuccess {
+		t.Errorf("expected exit status success, got %s\nconsole output:\n%s", detail.ExitStatus, status.ConsoleOutput)
+	}
+
+	// First invocation: both defaults should be used
+	if !strings.Contains(status.ConsoleOutput, "COLOR=blue SIZE=medium") {
+		t.Errorf("expected defaults 'COLOR=blue SIZE=medium', got:\n%s", status.ConsoleOutput)
+	}
+
+	// Second invocation: color overridden, size default
+	if !strings.Contains(status.ConsoleOutput, "COLOR=red SIZE=medium") {
+		t.Errorf("expected 'COLOR=red SIZE=medium', got:\n%s", status.ConsoleOutput)
+	}
+}
+
+func TestExecuteCompositeActionWithEnvOverrides(t *testing.T) {
+	// Skip if bash is not available
+	if _, err := os.Stat("/bin/bash"); os.IsNotExist(err) {
+		t.Skip("bash not available")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	executor := NewWorkflowExecutor()
+
+	tmpDir, err := os.MkdirTemp("", "composite-env-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	actionDir := filepath.Join(tmpDir, "env-action")
+	if err := os.MkdirAll(actionDir, 0755); err != nil {
+		t.Fatalf("failed to create action dir: %v", err)
+	}
+
+	// Composite action with per-step env overrides
+	actionYml := `name: 'Env Override Composite'
+description: 'Tests env override in composite action steps'
+runs:
+  using: 'composite'
+  steps:
+    - run: echo "STEP1_FOO=$FOO"
+      shell: bash
+      env:
+        FOO: bar
+    - run: echo "STEP2_FOO=${FOO:-unset}"
+      shell: bash
+`
+	if err := os.WriteFile(filepath.Join(actionDir, "action.yml"), []byte(actionYml), 0644); err != nil {
+		t.Fatalf("failed to write action.yml: %v", err)
+	}
+
+	request := &PolicyEngineRequest{
+		Workflow: fmt.Sprintf(`
+name: Composite Env Override Test
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: %s
+`, actionDir),
+		Context: map[string]interface{}{
+			"config": map[string]interface{}{
+				"env": map[string]interface{}{
+					"GITHUB_REPOSITORY": "test/repo",
+				},
+			},
+		},
+	}
+
+	status, err := executor.ExecuteWorkflow(ctx, request)
+	if err != nil {
+		t.Fatalf("workflow execution failed: %v", err)
+	}
+
+	if status.Status != StatusComplete {
+		t.Errorf("expected status complete, got %s", status.Status)
+	}
+
+	detail, ok := status.Detail.(PolicyEngineComplete)
+	if !ok {
+		t.Fatal("expected PolicyEngineComplete detail")
+	}
+
+	if detail.ExitStatus != ExitStatusSuccess {
+		t.Errorf("expected exit status success, got %s\nconsole output:\n%s", detail.ExitStatus, status.ConsoleOutput)
+	}
+
+	// Step 1 should see the env override
+	if !strings.Contains(status.ConsoleOutput, "STEP1_FOO=bar") {
+		t.Errorf("expected 'STEP1_FOO=bar' in output, got:\n%s", status.ConsoleOutput)
+	}
+	// Step 2 should NOT have FOO since it wasn't set at that level
+	if !strings.Contains(status.ConsoleOutput, "STEP2_FOO=unset") {
+		t.Errorf("expected 'STEP2_FOO=unset' in output, got:\n%s", status.ConsoleOutput)
 	}
 }

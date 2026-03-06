@@ -1,0 +1,84 @@
+version: 2
+
+project_name: policy_engine
+
+before:
+  hooks:
+    - go mod tidy
+    # Download Deno for every platform up front.  Each platform has its own
+    # zip (e.g. deno_embedded/deno-linux-amd64.zip) and a matching Go file
+    # with build constraints (e.g. deno_embed_linux_amd64.go) that embeds it.
+    # Because every file is platform-specific, parallel builds don't conflict.
+    - make download-deno-all
+
+builds:
+  - id: policy_engine
+    main: ./cmd/policy-engine/
+    binary: policy_engine
+    tags:
+      - embed_deno
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+    files:
+      - README.md
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: publicdomainrelay
+    name: sshai
+  prerelease: auto
+  name_template: "Policy Engine {{.Version}}"
+  header: |
+    ## Policy Engine {{.Version}}
+
+    Go binary releases with embedded Deno runtime for expression evaluation.
+
+    ### Platforms
+    - Linux (amd64, arm64)
+    - macOS (amd64, arm64)
+    - Windows (amd64)
+
+    Each binary includes an embedded Deno runtime — no external dependencies required.

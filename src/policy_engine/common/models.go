@@ -1,10 +1,11 @@
 // Package policy_engine implements GitHub Actions workflow evaluation as a policy engine.
 // This is a Go port of the Python policy_engine.py.
-package main
+package common
 
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -154,12 +155,63 @@ type GitHubCheckSuiteAnnotation struct {
 
 // Task represents an async task for workflow execution.
 type Task struct {
-	ID        string
-	Status    string
-	Result    string
-	Error     error
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID            string
+	Status        string
+	Result        string
+	Error         error
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	ConsoleOutput []string
+	consoleMu     sync.RWMutex
+	subscribers   []chan string
+	subscriberMu  sync.Mutex
+}
+
+// AppendConsoleOutput appends a line of console output and notifies subscribers.
+func (t *Task) AppendConsoleOutput(line string) {
+	t.consoleMu.Lock()
+	t.ConsoleOutput = append(t.ConsoleOutput, line)
+	t.consoleMu.Unlock()
+
+	t.subscriberMu.Lock()
+	defer t.subscriberMu.Unlock()
+	for _, ch := range t.subscribers {
+		select {
+		case ch <- line:
+		default:
+			// Skip slow subscribers
+		}
+	}
+}
+
+// GetConsoleOutput returns all console output collected so far.
+func (t *Task) GetConsoleOutput() string {
+	t.consoleMu.RLock()
+	defer t.consoleMu.RUnlock()
+	return strings.Join(t.ConsoleOutput, "\n")
+}
+
+// Subscribe returns a channel that receives new console output lines.
+// Call Unsubscribe with the returned channel when done.
+func (t *Task) Subscribe() chan string {
+	ch := make(chan string, 64)
+	t.subscriberMu.Lock()
+	t.subscribers = append(t.subscribers, ch)
+	t.subscriberMu.Unlock()
+	return ch
+}
+
+// Unsubscribe removes a subscriber channel.
+func (t *Task) Unsubscribe(ch chan string) {
+	t.subscriberMu.Lock()
+	defer t.subscriberMu.Unlock()
+	for i, sub := range t.subscribers {
+		if sub == ch {
+			t.subscribers = append(t.subscribers[:i], t.subscribers[i+1:]...)
+			close(ch)
+			return
+		}
+	}
 }
 
 // TaskManager manages async tasks.
@@ -181,10 +233,11 @@ func (tm *TaskManager) CreateTask(id string) *Task {
 	defer tm.mu.Unlock()
 
 	task := &Task{
-		ID:        id,
-		Status:    "PENDING",
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		ID:            id,
+		Status:        "PENDING",
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		ConsoleOutput: []string{},
 	}
 	tm.tasks[id] = task
 	return task
@@ -213,16 +266,18 @@ func (tm *TaskManager) UpdateTask(id string, status string, result string, err e
 
 // WorkflowExecutionContext holds the context for executing a workflow.
 type WorkflowExecutionContext struct {
-	Inputs       map[string]interface{}
-	Env          map[string]interface{}
-	Secrets      map[string]string
-	Outputs      map[string]map[string]interface{}
-	Annotations  map[string][]GitHubCheckSuiteAnnotation
-	Workspace    string
-	TempDir      string
-	CacheDir     string
-	Shell        string
-	Error        error
+	Inputs        map[string]interface{}
+	Env           map[string]interface{}
+	Secrets       map[string]string
+	Outputs       map[string]map[string]interface{}
+	Annotations   map[string][]GitHubCheckSuiteAnnotation
+	Workspace     string
+	TempDir       string
+	CacheDir      string
+	ToolCacheDir  string // RUNNER_TOOL_CACHE: where actions/tool-cache stores downloads
+	HomeDir       string // Ephemeral HOME to prevent writes to real ~
+	Shell         string
+	Error         error
 	ConsoleOutput []string
 }
 

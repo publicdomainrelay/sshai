@@ -2,3 +2,9 @@
 .cache/
 *.exe
 *.out
+policy_engine
+dist/
+deno_embedded/deno-*.zip
+.port
+my_workflow.yml
+common/deno_embedded/*.zip

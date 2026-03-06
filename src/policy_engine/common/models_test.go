@@ -1,4 +1,4 @@
-package main
+package common
 
 import (
 	"encoding/json"
@@ -400,6 +400,68 @@ func TestPolicyEngineStatusDetailInterface(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTaskConsoleOutputStreaming(t *testing.T) {
+	tm := NewTaskManager()
+	task := tm.CreateTask("stream-test")
+
+	// Subscribe before appending
+	ch := task.Subscribe()
+
+	// Append some output
+	task.AppendConsoleOutput("line 1")
+	task.AppendConsoleOutput("line 2")
+
+	// Read from subscriber channel
+	line1 := <-ch
+	if line1 != "line 1" {
+		t.Errorf("expected 'line 1', got '%s'", line1)
+	}
+	line2 := <-ch
+	if line2 != "line 2" {
+		t.Errorf("expected 'line 2', got '%s'", line2)
+	}
+
+	// Get accumulated output
+	output := task.GetConsoleOutput()
+	if output != "line 1\nline 2" {
+		t.Errorf("expected 'line 1\\nline 2', got '%s'", output)
+	}
+
+	// Unsubscribe
+	task.Unsubscribe(ch)
+
+	// Appending after unsubscribe should not panic
+	task.AppendConsoleOutput("line 3")
+
+	output = task.GetConsoleOutput()
+	if output != "line 1\nline 2\nline 3" {
+		t.Errorf("expected 'line 1\\nline 2\\nline 3', got '%s'", output)
+	}
+}
+
+func TestTaskMultipleSubscribers(t *testing.T) {
+	tm := NewTaskManager()
+	task := tm.CreateTask("multi-sub-test")
+
+	ch1 := task.Subscribe()
+	ch2 := task.Subscribe()
+
+	task.AppendConsoleOutput("broadcast")
+
+	msg1 := <-ch1
+	msg2 := <-ch2
+
+	if msg1 != "broadcast" {
+		t.Errorf("subscriber 1: expected 'broadcast', got '%s'", msg1)
+	}
+	if msg2 != "broadcast" {
+		t.Errorf("subscriber 2: expected 'broadcast', got '%s'", msg2)
+	}
+
+	task.Unsubscribe(ch1)
+	task.Unsubscribe(ch2)
 }
 
 func TestTaskTimestamps(t *testing.T) {

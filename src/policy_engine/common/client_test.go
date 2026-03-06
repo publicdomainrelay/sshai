@@ -1,13 +1,15 @@
-package main
+package common
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -363,6 +365,110 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestClientStreamConsoleOutput(t *testing.T) {
+	// Create a mock SSE server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/request/console_output_stream/") {
+			t.Errorf("expected path prefix /request/console_output_stream/, got %s", r.URL.Path)
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("expected ResponseWriter to implement Flusher")
+			return
+		}
+
+		fmt.Fprintf(w, "data: hello world\n\n")
+		flusher.Flush()
+		fmt.Fprintf(w, "data: second line\n\n")
+		flusher.Flush()
+		fmt.Fprintf(w, "event: done\ndata: SUCCESS\n\n")
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 30*time.Second)
+
+	var buf bytes.Buffer
+	ctx := context.Background()
+	err := client.StreamConsoleOutput(ctx, "test-task-id", &buf)
+	if err != nil {
+		t.Fatalf("StreamConsoleOutput failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "hello world") {
+		t.Errorf("expected output to contain 'hello world', got: %s", output)
+	}
+	if !strings.Contains(output, "second line") {
+		t.Errorf("expected output to contain 'second line', got: %s", output)
+	}
+}
+
+func TestClientIntegrationWithConsoleOutput(t *testing.T) {
+	// Full integration: create -> wait -> get console output
+	if _, err := os.Stat("/bin/bash"); os.IsNotExist(err) {
+		t.Skip("bash not available")
+	}
+
+	policyServer := NewServer(":0")
+	ts := httptest.NewServer(policyServer.mux)
+	defer ts.Close()
+
+	client := NewClient(ts.URL, 60*time.Second)
+
+	request := &PolicyEngineRequest{
+		Workflow: `
+name: Client Console Output Test
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo "client output test"
+`,
+		Context: map[string]interface{}{
+			"config": map[string]interface{}{
+				"env": map[string]interface{}{
+					"GITHUB_REPOSITORY": "test/repo",
+				},
+			},
+		},
+	}
+
+	ctx := context.Background()
+
+	status, err := client.CreateRequest(ctx, request)
+	if err != nil {
+		t.Fatalf("CreateRequest failed: %v", err)
+	}
+
+	detail := status.Detail.(map[string]interface{})
+	taskID := detail["id"].(string)
+
+	// Wait for completion
+	finalStatus, err := client.WaitForCompletion(ctx, taskID, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("WaitForCompletion failed: %v", err)
+	}
+
+	if finalStatus.Status != StatusComplete {
+		t.Fatalf("expected status complete, got %s", finalStatus.Status)
+	}
+
+	// Now get console output
+	output, err := client.GetConsoleOutput(ctx, taskID)
+	if err != nil {
+		t.Fatalf("GetConsoleOutput failed: %v", err)
+	}
+
+	if !strings.Contains(output, "client output test") {
+		t.Errorf("expected console output to contain 'client output test', got: %s", output)
+	}
 }
 
 func TestClientWithMockGitHubServer(t *testing.T) {

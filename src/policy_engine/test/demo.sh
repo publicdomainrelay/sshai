@@ -15,7 +15,7 @@ echo "===================="
 # Check if policy engine binary exists
 if [ ! -f "$POLICY_ENGINE" ]; then
     echo "❌ Policy engine binary not found. Building..."
-    go build -o policy_engine main.go
+    go build -o policy_engine ./cmd/policy-engine/
 fi
 
 # Start the API server in background

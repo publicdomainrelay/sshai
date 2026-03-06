@@ -1,0 +1,18 @@
+name: 'Local Composite Test Action'
+description: 'A local composite action for testing executeCompositeAction'
+inputs:
+  greeting:
+    description: 'A greeting message'
+    default: 'Hello'
+  name:
+    description: 'A name to greet'
+    default: 'World'
+runs:
+  using: 'composite'
+  steps:
+    - run: echo "COMPOSITE_GREETING=$INPUT_GREETING $INPUT_NAME"
+      shell: bash
+    - run: echo "COMPOSITE_ACTION_PATH=$GITHUB_ACTION_PATH"
+      shell: bash
+    - run: echo "COMPOSITE_STEP_THREE=done"
+      shell: bash

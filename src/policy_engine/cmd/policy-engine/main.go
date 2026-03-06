@@ -4,9 +4,12 @@
 //
 // Usage:
 //
-//	policy_engine api --bind 0.0.0.0:8080
-//	policy_engine client --endpoint http://localhost:8080 create --workflow workflow.yml --repository org/repo
-//	policy_engine client --endpoint http://localhost:8080 status --task-id <id>
+//	policy_engine api --bind 127.0.0.1:0 --port-file .port
+//	policy_engine api --bind /tmp/pe.sock
+//	policy_engine client -e http://127.0.0.1:8080 create -w workflow.yml -R org/repo
+//	policy_engine client -e unix:/tmp/pe.sock create -w workflow.yml -R org/repo
+//	policy_engine client -e "$ENDPOINT" output -t <id> --follow
+//	policy_engine client -e "$ENDPOINT" status -t <id> --wait
 package main
 
 import (
@@ -14,11 +17,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
 	"syscall"
 	"time"
+
+	"policy_engine/common"
 
 	"github.com/spf13/cobra"
 )
@@ -44,7 +50,83 @@ This is a Go port of the Python policy_engine.py, providing:
 - HTTP API for submitting and monitoring workflow executions
 - GitHub webhook integration
 - Workflow step execution (uses, run)
-- Client CLI for interacting with the API`,
+- Client CLI for interacting with the API
+
+Example: start the server on a random port, submit a workflow, stream output,
+and check the status.
+
+  # 1. Create a workflow file
+  cat > my_workflow.yml <<'EOF'
+  name: Hello World
+  jobs:
+    greet:
+      runs-on: ubuntu-latest
+      steps:
+      - id: say-hello
+        run: |
+          echo "Hello from the policy engine!"
+          echo "greeting=hello" >> $GITHUB_OUTPUT
+      - env:
+          MSG: "${{ steps.say-hello.outputs.greeting }}"
+        run: |
+          echo "Output from previous step: $MSG"
+  EOF
+
+  # 2. Start the API server on a random port; the bound address is
+  #    written to .port so other processes can discover it.
+  policy_engine api --bind 127.0.0.1:0 --port-file .port &
+  while [ ! -s .port ]; do sleep 0.1; done
+  ENDPOINT="http://$(cat .port)"
+
+  # 3. Submit the workflow and capture the task ID
+  TASK_ID=$(policy_engine client -e "$ENDPOINT" create \
+    -w my_workflow.yml -R myorg/myrepo \
+    -i key=value \
+    | jq -r '.detail.id')
+
+  # 4. Stream console output in real time (follows until done)
+  policy_engine client -e "$ENDPOINT" output \
+    -t "$TASK_ID" --follow
+
+  # 5. Check the final status (poll until complete)
+  policy_engine client -e "$ENDPOINT" status \
+    -t "$TASK_ID" --wait
+
+  # Or get the status as YAML
+  policy_engine client -e "$ENDPOINT" status \
+    -t "$TASK_ID" --wait --output-format yaml
+
+Unix socket example (avoids allocating a TCP port entirely):
+
+  # Start on a Unix socket
+  policy_engine api --bind /tmp/pe.sock --port-file .port &
+  while [ ! -s .port ]; do sleep 0.1; done
+
+  # The client accepts "unix:" endpoints
+  TASK_ID=$(policy_engine client -e unix:/tmp/pe.sock create \
+    -w my_workflow.yml -R myorg/myrepo \
+    | jq -r '.detail.id')
+  policy_engine client -e unix:/tmp/pe.sock output -t "$TASK_ID" -f
+  policy_engine client -e unix:/tmp/pe.sock status -t "$TASK_ID" --wait
+
+You can also use the HTTP API directly with curl:
+
+  # Submit a workflow (TCP)
+  curl -s -X POST http://127.0.0.1:8080/request/create \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "workflow": "name: Test\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n    - run: echo hi",
+      "context": {"config": {"env": {"GITHUB_REPOSITORY": "org/repo"}}}
+    }'
+
+  # Submit via Unix socket
+  curl -s --unix-socket /tmp/pe.sock http://localhost/request/create \
+    -H 'Content-Type: application/json' \
+    -d '{"workflow": "...", "context": {"config": {"env": {"GITHUB_REPOSITORY": "org/repo"}}}}'
+
+  # Check status / stream output
+  curl -s http://127.0.0.1:8080/request/status/<task-id>
+  curl -N http://127.0.0.1:8080/request/console_output_stream/<task-id>`,
 	Version: Version,
 }
 
@@ -82,11 +164,19 @@ var clientStatusCmd = &cobra.Command{
 	Run:   runClientStatus,
 }
 
+var clientOutputCmd = &cobra.Command{
+	Use:   "output",
+	Short: "Get console output of a workflow execution",
+	Long:  `Retrieve the console output of a workflow execution. Use --follow to stream output as it runs.`,
+	Run:   runClientOutput,
+}
+
 // CLI flags
 var (
 	// API flags
-	apiBind    string
-	apiWorkers int
+	apiBind     string
+	apiPortFile string
+	apiWorkers  int
 
 	// Client flags
 	clientEndpoint    string
@@ -103,11 +193,16 @@ var (
 	clientTaskID       string
 	clientPollInterval float64
 	clientWait         bool
+
+	// Client output flags
+	clientOutputTaskID string
+	clientFollow       bool
 )
 
 func init() {
 	// API command flags
-	apiCmd.Flags().StringVar(&apiBind, "bind", "127.0.0.1:8080", "Address to bind the server to")
+	apiCmd.Flags().StringVar(&apiBind, "bind", "127.0.0.1:8080", "Address to bind (host:port, :0 for random port, or /path/to/socket for Unix socket)")
+	apiCmd.Flags().StringVar(&apiPortFile, "port-file", "", "Write the bound address to this file after listening (useful with --bind :0)")
 	apiCmd.Flags().IntVar(&apiWorkers, "workers", defaultWorkers(), "Number of workers (informational, Go uses goroutines)")
 
 	// Worker command flags
@@ -133,9 +228,15 @@ func init() {
 	clientStatusCmd.Flags().BoolVar(&clientWait, "wait", false, "Wait for completion")
 	clientStatusCmd.MarkFlagRequired("task-id")
 
+	// Client output flags
+	clientOutputCmd.Flags().StringVarP(&clientOutputTaskID, "task-id", "t", "", "Task ID to get output for (required)")
+	clientOutputCmd.Flags().BoolVarP(&clientFollow, "follow", "f", false, "Follow/stream output as it runs (SSE)")
+	clientOutputCmd.MarkFlagRequired("task-id")
+
 	// Build command tree
 	clientCmd.AddCommand(clientCreateCmd)
 	clientCmd.AddCommand(clientStatusCmd)
+	clientCmd.AddCommand(clientOutputCmd)
 	rootCmd.AddCommand(apiCmd)
 	rootCmd.AddCommand(workerCmd)
 	rootCmd.AddCommand(clientCmd)
@@ -150,7 +251,24 @@ func runAPIServer(cmd *cobra.Command, args []string) {
 	log.Printf("Bind: %s", apiBind)
 	log.Printf("Go routines will handle concurrent requests")
 
-	server := NewServer(apiBind)
+	server := common.NewServer(apiBind)
+
+	// Create listener first so we know the bound address before serving.
+	ln, err := server.Listen()
+	if err != nil {
+		log.Fatalf("Listen error: %v", err)
+	}
+
+	boundAddr := server.BoundAddr()
+	log.Printf("Listening on %s", boundAddr)
+
+	// Write port file if requested.
+	if apiPortFile != "" {
+		if err := os.WriteFile(apiPortFile, []byte(boundAddr), 0644); err != nil {
+			log.Fatalf("Failed to write port file %s: %v", apiPortFile, err)
+		}
+		log.Printf("Wrote bound address to %s", apiPortFile)
+	}
 
 	// Handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -164,9 +282,13 @@ func runAPIServer(cmd *cobra.Command, args []string) {
 		if err := server.Shutdown(ctx); err != nil {
 			log.Printf("Server shutdown error: %v", err)
 		}
+		// Clean up port file on shutdown.
+		if apiPortFile != "" {
+			os.Remove(apiPortFile)
+		}
 	}()
 
-	if err := server.Start(); err != nil {
+	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
 	}
 }
@@ -191,7 +313,7 @@ func runClientCreate(cmd *cobra.Command, args []string) {
 	if _, err := os.Stat(clientWorkflow); err == nil {
 		// It's a file
 		var err error
-		workflow, err = LoadWorkflowFromFile(clientWorkflow)
+		workflow, err = common.LoadWorkflowFromFile(clientWorkflow)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading workflow: %v\n", err)
 			os.Exit(1)
@@ -228,7 +350,7 @@ func runClientCreate(cmd *cobra.Command, args []string) {
 	}
 
 	// Build request
-	request := &PolicyEngineRequest{
+	request := &common.PolicyEngineRequest{
 		Inputs:   inputs,
 		Workflow: workflow,
 		Context: map[string]interface{}{
@@ -247,7 +369,7 @@ func runClientCreate(cmd *cobra.Command, args []string) {
 	}
 
 	// Create client and submit request
-	client := NewClient(clientEndpoint, time.Duration(clientTimeout)*time.Second)
+	client := common.NewClient(clientEndpoint, time.Duration(clientTimeout)*time.Second)
 	status, err := client.CreateRequest(ctx, request)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating request: %v\n", err)
@@ -255,12 +377,41 @@ func runClientCreate(cmd *cobra.Command, args []string) {
 	}
 
 	// Output result
-	output, err := FormatOutput(status, clientOutputFormat)
+	output, err := common.FormatOutput(status, clientOutputFormat)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error formatting output: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Println(output)
+}
+
+func runClientOutput(cmd *cobra.Command, args []string) {
+	ctx := context.Background()
+
+	if clientTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(clientTimeout)*time.Second)
+		defer cancel()
+	}
+
+	client := common.NewClient(clientEndpoint, time.Duration(clientTimeout)*time.Second)
+
+	if clientFollow {
+		// Stream output via SSE
+		err := client.StreamConsoleOutput(ctx, clientOutputTaskID, os.Stdout)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error streaming output: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		// Get current console output
+		output, err := client.GetConsoleOutput(ctx, clientOutputTaskID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting output: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Print(output)
+	}
 }
 
 func runClientStatus(cmd *cobra.Command, args []string) {
@@ -272,9 +423,9 @@ func runClientStatus(cmd *cobra.Command, args []string) {
 		defer cancel()
 	}
 
-	client := NewClient(clientEndpoint, time.Duration(clientTimeout)*time.Second)
+	client := common.NewClient(clientEndpoint, time.Duration(clientTimeout)*time.Second)
 
-	var status *PolicyEngineStatus
+	var status *common.PolicyEngineStatus
 	var err error
 
 	if clientWait {
@@ -289,7 +440,7 @@ func runClientStatus(cmd *cobra.Command, args []string) {
 	}
 
 	// Output result
-	output, err := FormatOutput(status, clientOutputFormat)
+	output, err := common.FormatOutput(status, clientOutputFormat)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error formatting output: %v\n", err)
 		os.Exit(1)

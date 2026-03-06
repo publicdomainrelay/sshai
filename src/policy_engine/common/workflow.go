@@ -1,8 +1,9 @@
-package main
+package common
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,12 +54,14 @@ type WorkflowExecutor struct {
 	DenoPath   string
 	NodeJSPath string
 	Context    *WorkflowExecutionContext
+	Task       *Task // optional: if set, console output is streamed to the task
 }
 
 // NewWorkflowExecutor creates a new workflow executor.
+// Deno is resolved via the deno manager (embedded -> PATH -> download).
 func NewWorkflowExecutor() *WorkflowExecutor {
 	return &WorkflowExecutor{
-		DenoPath:   findBinary("deno"),
+		DenoPath:   ResolveDeno(""),
 		NodeJSPath: findBinary("node"),
 		Context:    NewWorkflowExecutionContext(),
 	}
@@ -84,6 +87,20 @@ func (e *WorkflowExecutor) ExecuteWorkflow(ctx context.Context, request *PolicyE
 	if err := e.initializeContext(request); err != nil {
 		return nil, fmt.Errorf("failed to initialize context: %w", err)
 	}
+
+	// Clean up ephemeral directories when done.
+	// CacheDir is intentionally kept (persists downloaded actions between runs).
+	defer func() {
+		if e.Context.Workspace != "" {
+			os.RemoveAll(e.Context.Workspace)
+		}
+		if e.Context.ToolCacheDir != "" {
+			os.RemoveAll(e.Context.ToolCacheDir)
+		}
+		if e.Context.HomeDir != "" {
+			os.RemoveAll(e.Context.HomeDir)
+		}
+	}()
 
 	// Execute each job
 	for jobName, job := range workflow.Jobs {
@@ -124,6 +141,15 @@ func (e *WorkflowExecutor) initializeContext(request *PolicyEngineRequest) error
 		}
 	}
 
+	// In real GitHub Actions, GITHUB_TOKEN is available as both a secret
+	// and an environment variable. Mirror that here so ${{ github.token }}
+	// resolves correctly in action input defaults.
+	if token, ok := e.Context.Secrets["GITHUB_TOKEN"]; ok && token != "" {
+		if _, envSet := e.Context.Env["GITHUB_TOKEN"]; !envSet {
+			e.Context.Env["GITHUB_TOKEN"] = token
+		}
+	}
+
 	// Set up temp and cache directories
 	cwd, _ := os.Getwd()
 	e.Context.CacheDir = filepath.Join(cwd, ".cache")
@@ -137,6 +163,22 @@ func (e *WorkflowExecutor) initializeContext(request *PolicyEngineRequest) error
 		return fmt.Errorf("failed to create workspace: %w", err)
 	}
 	e.Context.Workspace = workspace
+
+	// Create ephemeral RUNNER_TOOL_CACHE so that actions like setup-python
+	// download/install into a directory we control (not the real system).
+	toolCache, err := os.MkdirTemp(e.Context.TempDir, "toolcache-*")
+	if err != nil {
+		return fmt.Errorf("failed to create tool cache dir: %w", err)
+	}
+	e.Context.ToolCacheDir = toolCache
+
+	// Create ephemeral HOME so that pip --user, npm, and similar tools
+	// never write to the real home directory.
+	homeDir, err := os.MkdirTemp(e.Context.TempDir, "home-*")
+	if err != nil {
+		return fmt.Errorf("failed to create ephemeral home dir: %w", err)
+	}
+	e.Context.HomeDir = homeDir
 
 	return nil
 }
@@ -187,6 +229,8 @@ func (e *WorkflowExecutor) executeJob(ctx context.Context, jobName string, job *
 }
 
 // evaluateCondition evaluates an if condition.
+// Matches the Python behavior: bool/int are handled directly, string conditions
+// that don't contain ${{ }} are wrapped in ${{ }}, then evaluated.
 func (e *WorkflowExecutor) evaluateCondition(condition interface{}) (bool, error) {
 	switch v := condition.(type) {
 	case bool:
@@ -198,15 +242,26 @@ func (e *WorkflowExecutor) evaluateCondition(condition interface{}) (bool, error
 			return true, nil
 		}
 		// Handle simple truthy/falsy values
-		v = strings.ToLower(strings.TrimSpace(v))
-		if v == "true" || v == "1" {
+		trimmed := strings.ToLower(strings.TrimSpace(v))
+		if trimmed == "true" || trimmed == "1" {
 			return true, nil
 		}
-		if v == "false" || v == "0" {
+		if trimmed == "false" || trimmed == "0" {
 			return false, nil
 		}
-		// For complex expressions, we'd need JavaScript evaluation
-		// For now, default to true
+		// Wrap in ${{ }} if not already (matching Python behavior)
+		exprStr := v
+		if !strings.Contains(exprStr, "${{") {
+			exprStr = "${{ " + exprStr + " }}"
+		}
+		evaluated := e.evaluateExpression(exprStr)
+		evaluated = strings.ToLower(strings.TrimSpace(evaluated))
+		if evaluated == "__github_actions_always__" {
+			return true, nil
+		}
+		if evaluated == "false" || evaluated == "0" || evaluated == "" || evaluated == "null" || evaluated == "undefined" {
+			return false, nil
+		}
 		return true, nil
 	default:
 		return true, nil
@@ -237,41 +292,190 @@ func (e *WorkflowExecutor) buildStepEnv(step *PolicyEngineWorkflowJobStep) map[s
 	// Add workspace paths
 	env["GITHUB_WORKSPACE"] = e.Context.Workspace
 	env["RUNNER_TEMP"] = e.Context.TempDir
-	env["RUNNER_TOOL_CACHE"] = e.Context.TempDir
+
+	// Point tool cache and agent tools directory at our ephemeral dir.
+	// On macOS, setup-python hard-codes AGENT_TOOLSDIRECTORY to
+	// /Users/runner/hostedtoolcache, then copies it to RUNNER_TOOL_CACHE.
+	// Setting both ensures actions never escape the sandbox.
+	env["RUNNER_TOOL_CACHE"] = e.Context.ToolCacheDir
+	env["AGENT_TOOLSDIRECTORY"] = e.Context.ToolCacheDir
+
+	// Use an ephemeral HOME so pip --user, npm config, and similar tools
+	// write to a directory we control rather than the real home.
+	env["HOME"] = e.Context.HomeDir
 
 	return env
 }
 
 // evaluateExpression evaluates GitHub Actions expressions like ${{ ... }}.
+// When Deno is available, expressions are evaluated as JavaScript (matching
+// the Python implementation). Falls back to simple property-path resolution.
 func (e *WorkflowExecutor) evaluateExpression(expr string) string {
 	if !strings.Contains(expr, "${{") {
 		return expr
 	}
 
-	// Build context for template
+	re := regexp.MustCompile(`\$\{\{\s*(.+?)\s*\}\}`)
+
+	// Build the full result by replacing each ${{ ... }} occurrence
+	result := ""
+	startIdx := 0
+	for _, loc := range re.FindAllStringIndex(expr, -1) {
+		result += expr[startIdx:loc[0]]
+		inner := re.FindStringSubmatch(expr[loc[0]:loc[1]])[1]
+		inner = strings.TrimSpace(inner)
+		evaluated := e.evaluateInnerExpression(inner)
+		result += evaluated
+		startIdx = loc[1]
+	}
+	result += expr[startIdx:]
+
+	return result
+}
+
+// evaluateInnerExpression evaluates a single expression (the content between ${{ and }}).
+// Uses Deno if available, otherwise falls back to simple property-path resolution.
+func (e *WorkflowExecutor) evaluateInnerExpression(inner string) string {
+	if e.DenoPath != "" {
+		result, err := e.evaluateUsingJavaScript(inner)
+		if err == nil {
+			return result
+		}
+		// Fall through to simple resolution on error
+	}
+
+	// Fallback: simple property-path resolution
 	data := map[string]interface{}{
 		"github": e.buildGitHubContext(),
 		"steps":  e.Context.Outputs,
 		"inputs": e.Context.Inputs,
 		"env":    e.Context.Env,
 	}
+	value := e.resolvePropertyPath(inner, data)
+	if value != nil {
+		return fmt.Sprintf("%v", value)
+	}
+	return "${{ " + inner + " }}"
+}
 
-	// Simple regex-based replacement for ${{ expression }}
-	re := regexp.MustCompile(`\$\{\{\s*(.+?)\s*\}\}`)
-	result := re.ReplaceAllStringFunc(expr, func(match string) string {
-		// Extract the expression
-		inner := re.FindStringSubmatch(match)[1]
-		inner = strings.TrimSpace(inner)
+// evaluateUsingJavaScript evaluates an expression using Deno, matching the
+// Python _evaluate_using_javascript implementation. It constructs a JS file
+// with the github, runner, steps, and inputs contexts, then evaluates the
+// expression and captures the output.
+func (e *WorkflowExecutor) evaluateUsingJavaScript(codeBlock string) (string, error) {
+	// Build contexts
+	githubCtx := e.buildGitHubContext()
+	stepsCtx := e.Context.Outputs
+	inputsCtx := e.Context.Inputs
 
-		// Handle simple property access like github.actor
-		value := e.resolvePropertyPath(inner, data)
-		if value != nil {
-			return fmt.Sprintf("%v", value)
+	runnerCtx := map[string]interface{}{
+		"debug": 1,
+	}
+
+	// Transform property accessors: dot notation -> bracket notation
+	// This avoids issues with JS reserved words and ensures property access
+	// works correctly (matching Python transform_property_accessors).
+	transformed := transformPropertyAccessors(codeBlock)
+
+	githubJSON, _ := json.Marshal(githubCtx)
+	runnerJSON, _ := json.Marshal(runnerCtx)
+	stepsJSON, _ := json.Marshal(stepsCtx)
+	inputsJSON, _ := json.Marshal(inputsCtx)
+
+	jsCode := fmt.Sprintf(`function always() { return "__GITHUB_ACTIONS_ALWAYS__"; }
+const github = %s;
+const runner = %s;
+const steps = %s;
+const inputs = %s;
+const result = (%s);
+console.log(result)
+`, string(githubJSON), string(runnerJSON), string(stepsJSON), string(inputsJSON), transformed)
+
+	// Write to temp file
+	tmpDir := e.Context.TempDir
+	if tmpDir == "" {
+		tmpDir = os.TempDir()
+	}
+	jsFile, err := os.CreateTemp(tmpDir, "eval-*.js")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp JS file: %w", err)
+	}
+	jsPath := jsFile.Name()
+	defer os.Remove(jsPath)
+
+	if _, err := jsFile.WriteString(jsCode); err != nil {
+		jsFile.Close()
+		return "", fmt.Errorf("failed to write JS file: %w", err)
+	}
+	jsFile.Close()
+
+	// Run with Deno. Use "deno run" for clean output (no REPL prompts).
+	// The --no-prompt flag prevents permission prompts, and we allow read
+	// access to the temp dir for the eval file.
+	cmd := exec.Command(e.DenoPath, "run", "--no-prompt", jsPath)
+	devnull, _ := os.Open(os.DevNull)
+	if devnull != nil {
+		cmd.Stdin = devnull
+		defer devnull.Close()
+	}
+	if e.Context.Workspace != "" {
+		cmd.Dir = e.Context.Workspace
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("deno evaluation failed: %w: %s", err, stderr.String())
+	}
+
+	output := strings.TrimSpace(stdout.String())
+	return output, nil
+}
+
+// transformPropertyAccessors converts dot notation to bracket notation in JS
+// code, matching the Python transform_property_accessors function. This avoids
+// issues with property access within string literals.
+func transformPropertyAccessors(jsCode string) string {
+	var result strings.Builder
+	i := 0
+	for i < len(jsCode) {
+		ch := jsCode[i]
+		if ch == '"' || ch == '\'' {
+			// Inside a string literal: copy through to closing quote
+			quote := ch
+			result.WriteByte(ch)
+			i++
+			for i < len(jsCode) {
+				result.WriteByte(jsCode[i])
+				if jsCode[i] == quote {
+					i++
+					break
+				}
+				i++
+			}
+		} else if ch == '.' {
+			// Replace dot with bracket notation
+			result.WriteString("['")
+			i++
+			propStart := i
+			for i < len(jsCode) && (isAlphanumeric(jsCode[i]) || jsCode[i] == '_' || jsCode[i] == '-') {
+				i++
+			}
+			result.WriteString(jsCode[propStart:i])
+			result.WriteString("']")
+		} else {
+			result.WriteByte(ch)
+			i++
 		}
-		return match
-	})
+	}
+	return result.String()
+}
 
-	return result
+// isAlphanumeric returns true if the byte is a letter or digit.
+func isAlphanumeric(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }
 
 // resolvePropertyPath resolves a property path like "github.actor" from data.
@@ -330,19 +534,31 @@ func (e *WorkflowExecutor) buildGitHubContext() map[string]interface{} {
 
 // executeStepUses executes a step that uses an action.
 func (e *WorkflowExecutor) executeStepUses(ctx context.Context, step *PolicyEngineWorkflowJobStep, env map[string]string) error {
-	if !strings.Contains(step.Uses, "@") {
-		return fmt.Errorf("only uses: org/repo@version is supported, got: %s", step.Uses)
-	}
+	var actionPath string
 
-	// Parse uses format: org/repo@version
-	parts := strings.SplitN(step.Uses, "@", 2)
-	orgRepo := parts[0]
-	version := parts[1]
+	if strings.HasPrefix(step.Uses, "./") || strings.HasPrefix(step.Uses, "/") {
+		// Local action path: resolve relative to workspace
+		if strings.HasPrefix(step.Uses, "/") {
+			actionPath = step.Uses
+		} else {
+			actionPath = filepath.Join(e.Context.Workspace, step.Uses)
+		}
+		if _, err := os.Stat(actionPath); os.IsNotExist(err) {
+			return fmt.Errorf("local action path does not exist: %s", actionPath)
+		}
+	} else if strings.Contains(step.Uses, "@") {
+		// Remote action: org/repo@version
+		parts := strings.SplitN(step.Uses, "@", 2)
+		orgRepo := parts[0]
+		version := parts[1]
 
-	// Download the action
-	actionPath, err := e.downloadAction(orgRepo, version)
-	if err != nil {
-		return fmt.Errorf("failed to download action: %w", err)
+		var err error
+		actionPath, err = e.downloadAction(orgRepo, version)
+		if err != nil {
+			return fmt.Errorf("failed to download action: %w", err)
+		}
+	} else {
+		return fmt.Errorf("unsupported uses format (expected org/repo@version or ./path): %s", step.Uses)
 	}
 
 	// Read action.yml or action.yaml
@@ -351,7 +567,7 @@ func (e *WorkflowExecutor) executeStepUses(ctx context.Context, step *PolicyEngi
 	if _, err := os.Stat(actionYamlPath); os.IsNotExist(err) {
 		actionYamlPath = filepath.Join(actionPath, "action.yaml")
 	}
-	actionYaml, err = os.ReadFile(actionYamlPath)
+	actionYaml, err := os.ReadFile(actionYamlPath)
 	if err != nil {
 		return fmt.Errorf("failed to read action.yml: %w", err)
 	}
@@ -387,7 +603,7 @@ func (e *WorkflowExecutor) executeStepUses(ctx context.Context, step *PolicyEngi
 	// Execute based on action type
 	switch {
 	case strings.HasPrefix(actionDef.Runs.Using, "node"):
-		return e.executeNodeAction(ctx, actionPath, actionDef.Runs.Main, env)
+		return e.executeNodeAction(ctx, actionPath, actionDef.Runs.Main, env, step.ID)
 	case actionDef.Runs.Using == "composite":
 		return e.executeCompositeAction(ctx, actionDef.Runs.Steps, env)
 	default:
@@ -497,9 +713,32 @@ func unzip(src, dest string) error {
 }
 
 // executeNodeAction executes a Node.js action.
-func (e *WorkflowExecutor) executeNodeAction(ctx context.Context, actionPath, main string, env map[string]string) error {
+func (e *WorkflowExecutor) executeNodeAction(ctx context.Context, actionPath, main string, env map[string]string, stepID string) error {
 	if e.NodeJSPath == "" {
 		return fmt.Errorf("node.js not found in PATH")
+	}
+
+	// Create GITHUB_OUTPUT, GITHUB_ENV, GITHUB_PATH, and GITHUB_STATE files
+	// so that @actions/core functions (setOutput, exportVariable, addPath,
+	// saveState) write to ephemeral files we control.
+	type ghFile struct {
+		envKey string
+		prefix string
+	}
+	ghFiles := []ghFile{
+		{"GITHUB_OUTPUT", "node-output-"},
+		{"GITHUB_ENV", "node-env-"},
+		{"GITHUB_PATH", "node-path-"},
+		{"GITHUB_STATE", "node-state-"},
+	}
+	for _, gf := range ghFiles {
+		f, err := os.CreateTemp(e.Context.TempDir, gf.prefix+"*.txt")
+		if err != nil {
+			return fmt.Errorf("failed to create %s file: %w", gf.envKey, err)
+		}
+		env[gf.envKey] = f.Name()
+		f.Close()
+		defer os.Remove(f.Name())
 	}
 
 	mainPath := filepath.Join(actionPath, main)
@@ -508,15 +747,32 @@ func (e *WorkflowExecutor) executeNodeAction(ctx context.Context, actionPath, ma
 	cmd.Dir = e.Context.Workspace
 	cmd.Env = mapToEnvSlice(env)
 
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
+	output, err := e.runAndStreamOutput(cmd)
+	outputStr := output.String()
+	e.Context.ConsoleOutput = append(e.Context.ConsoleOutput, outputStr)
 
-	err := cmd.Run()
-	e.Context.ConsoleOutput = append(e.Context.ConsoleOutput, output.String())
+	// Parse outputs from GITHUB_OUTPUT file
+	if stepID != "" {
+		if outputFilePath, ok := env["GITHUB_OUTPUT"]; ok {
+			if content, readErr := os.ReadFile(outputFilePath); readErr == nil && len(content) > 0 {
+				outputs := parseGitHubActionsOutputs(string(content))
+				if e.Context.Outputs[stepID] == nil {
+					e.Context.Outputs[stepID] = make(map[string]interface{})
+				}
+				e.Context.Outputs[stepID]["outputs"] = outputs
+			}
+		}
+	}
 
-	// Parse outputs
-	e.parseOutputs(output.String())
+	// Apply env updates from GITHUB_ENV file
+	if envFilePath, ok := env["GITHUB_ENV"]; ok {
+		if content, readErr := os.ReadFile(envFilePath); readErr == nil && len(content) > 0 {
+			envUpdates := parseGitHubActionsOutputs(string(content))
+			for k, v := range envUpdates {
+				e.Context.Env[k] = v
+			}
+		}
+	}
 
 	return err
 }
@@ -582,8 +838,16 @@ func (e *WorkflowExecutor) executeStepRun(ctx context.Context, step *PolicyEngin
 	defer os.Remove(envFile.Name())
 	envFile.Close()
 
+	pathFile, err := os.CreateTemp(e.Context.TempDir, "path-*.txt")
+	if err != nil {
+		return fmt.Errorf("failed to create path file: %w", err)
+	}
+	defer os.Remove(pathFile.Name())
+	pathFile.Close()
+
 	env["GITHUB_OUTPUT"] = outputFile.Name()
 	env["GITHUB_ENV"] = envFile.Name()
+	env["GITHUB_PATH"] = pathFile.Name()
 
 	shell := e.Context.Shell
 	if step.Shell != "" {
@@ -654,17 +918,55 @@ func (e *WorkflowExecutor) runShellCommand(ctx context.Context, script, shell st
 	cmd.Dir = e.Context.Workspace
 	cmd.Env = mapToEnvSlice(env)
 
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-
-	err = cmd.Run()
-	e.Context.ConsoleOutput = append(e.Context.ConsoleOutput, output.String())
+	// Stream output line-by-line if task is attached
+	output, err := e.runAndStreamOutput(cmd)
+	outputStr := output.String()
+	e.Context.ConsoleOutput = append(e.Context.ConsoleOutput, outputStr)
 
 	// Parse annotations from output
-	e.parseAnnotations(output.String())
+	e.parseAnnotations(outputStr)
 
 	return err
+}
+
+// runAndStreamOutput runs a command, captures output, and streams lines to the task if attached.
+func (e *WorkflowExecutor) runAndStreamOutput(cmd *exec.Cmd) (bytes.Buffer, error) {
+	var output bytes.Buffer
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return output, fmt.Errorf("failed to get stdout pipe: %w", err)
+	}
+	cmd.Stderr = cmd.Stdout // merge stderr into stdout
+
+	if err := cmd.Start(); err != nil {
+		return output, fmt.Errorf("failed to start command: %w", err)
+	}
+
+	// Read output line by line and stream to task
+	buf := make([]byte, 4096)
+	for {
+		n, readErr := stdout.Read(buf)
+		if n > 0 {
+			chunk := string(buf[:n])
+			output.WriteString(chunk)
+			// Stream each line to the task
+			if e.Task != nil {
+				lines := strings.Split(chunk, "\n")
+				for _, line := range lines {
+					if line != "" {
+						e.Task.AppendConsoleOutput(line)
+					}
+				}
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+
+	err = cmd.Wait()
+	return output, err
 }
 
 // parseGitHubActionsOutputs parses GitHub Actions output format.
