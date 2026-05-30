@@ -212,6 +212,14 @@ func (e *WorkflowExecutor) executeJob(ctx context.Context, jobName string, job *
 		// Build step environment
 		stepEnv := e.buildStepEnv(&step)
 
+		// Emit GitHub Actions group markers so tangled and tooling can render
+		// each step as a collapsible section — both snapshot and live SSE stream.
+		groupStart := fmt.Sprintf("##[group]%s", stepName)
+		e.Context.ConsoleOutput = append(e.Context.ConsoleOutput, groupStart)
+		if e.Task != nil {
+			e.Task.AppendConsoleOutput(groupStart)
+		}
+
 		// Execute step
 		var err error
 		if step.Uses != "" {
@@ -220,7 +228,13 @@ func (e *WorkflowExecutor) executeJob(ctx context.Context, jobName string, job *
 			err = e.executeStepRun(ctx, &step, stepEnv)
 		}
 
+		e.Context.ConsoleOutput = append(e.Context.ConsoleOutput, "##[endgroup]")
+		if e.Task != nil {
+			e.Task.AppendConsoleOutput("##[endgroup]")
+		}
+
 		if err != nil {
+			e.Context.ConsoleOutput = append(e.Context.ConsoleOutput, fmt.Sprintf("##[error]step %s failed: %v", stepName, err))
 			return fmt.Errorf("step %s failed: %w", stepName, err)
 		}
 	}
@@ -548,14 +562,39 @@ func (e *WorkflowExecutor) executeStepUses(ctx context.Context, step *PolicyEngi
 		}
 	} else if strings.Contains(step.Uses, "@") {
 		// Remote action: org/repo@version
+		// Resolution order:
+		//   1. Repo-supplied: $ACTIONS_DIR/{org/repo}/ (from request context env)
+		//   2. PE system bundled: $BUNDLED_ACTIONS_DIR/{org/repo}/
+		//   3. Download from GitHub
 		parts := strings.SplitN(step.Uses, "@", 2)
 		orgRepo := parts[0]
 		version := parts[1]
 
-		var err error
-		actionPath, err = e.downloadAction(orgRepo, version)
-		if err != nil {
-			return fmt.Errorf("failed to download action: %w", err)
+		repoActionsDir := env["ACTIONS_DIR"]
+		if repoActionsDir == "" {
+			repoActionsDir = filepath.Join(e.Context.Workspace, ".tangled", "actions")
+		}
+		if repoActionsDir != "" {
+			repoLocal := filepath.Join(repoActionsDir, orgRepo)
+			if _, err := os.Stat(repoLocal); err == nil {
+				actionPath = repoLocal
+			}
+		}
+		if actionPath == "" {
+			if bundledDir := os.Getenv("BUNDLED_ACTIONS_DIR"); bundledDir != "" {
+				bundledPath := filepath.Join(bundledDir, orgRepo)
+				if _, err := os.Stat(bundledPath); err == nil {
+					actionPath = bundledPath
+				}
+			}
+		}
+
+		if actionPath == "" {
+			var err error
+			actionPath, err = e.downloadAction(orgRepo, version)
+			if err != nil {
+				return fmt.Errorf("failed to download action: %w", err)
+			}
 		}
 	} else {
 		return fmt.Errorf("unsupported uses format (expected org/repo@version or ./path): %s", step.Uses)
