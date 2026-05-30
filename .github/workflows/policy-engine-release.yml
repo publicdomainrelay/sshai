@@ -21,8 +21,8 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: sshai/src/policy_engine/go.mod
-          cache-dependency-path: sshai/src/policy_engine/go.sum
+          go-version-file: src/policy_engine/go.mod
+          cache-dependency-path: src/policy_engine/go.sum
 
       - name: Download Deno zips for all platforms
         run: make download-deno-all
