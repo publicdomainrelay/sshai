@@ -13,7 +13,7 @@ jobs:
       contents: write
     defaults:
       run:
-        working-directory: sshai/src/policy_engine
+        working-directory: src/policy_engine
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,7 +33,7 @@ jobs:
           distribution: goreleaser
           version: "~> v2"
           args: release --snapshot --clean
-          workdir: sshai/src/policy_engine
+          workdir: src/policy_engine
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
