@@ -68,8 +68,8 @@ RUN echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent && \
 COPY --from=builder /build/policy-engine /usr/local/bin/policy-engine
 
 # Bundled tangled-specific action replacements.
-# Source lives at ../../../bundled-actions/ relative to policy_engine; copied here for build context.
 # Mounted at /bundled-actions; spindle passes action_overrides pointing here.
+ENV BUNDLED_ACTIONS_DIR=/bundled-actions
 COPY bundled-actions/ /bundled-actions/
 
 # Set working directory
