@@ -1,0 +1,52 @@
+name: Policy Engine Release
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  goreleaser:
+    name: Build & release policy engine
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: sshai/src/policy_engine
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sshai/src/policy_engine/go.mod
+          cache-dependency-path: sshai/src/policy_engine/go.sum
+
+      - name: Download Deno zips for all platforms
+        run: make download-deno-all
+
+      - name: Build snapshot (all platforms, embedded Deno)
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --clean
+          workdir: sshai/src/policy_engine
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts to latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Recreate the 'latest' release, replacing any prior one
+          gh release delete latest --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+          git tag -f latest HEAD
+          git push origin latest --force
+          gh release create latest dist/*.tar.gz dist/*.zip dist/checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "latest ($(date -u +%Y-%m-%dT%H:%M:%SZ))" \
+            --notes "Policy engine binaries built from \`main\` at \`$GITHUB_SHA\`. Includes embedded Deno runtime — no external dependencies required." \
+            --latest
