@@ -15,7 +15,7 @@ runs:
     - shell: bash
       run: |
         set -euo pipefail
-        set -x
+        # set -x
 
         KNOT="${SPINDLE_KNOT:-}"
         REPO_DID="${SPINDLE_REPO_DID:-}"
