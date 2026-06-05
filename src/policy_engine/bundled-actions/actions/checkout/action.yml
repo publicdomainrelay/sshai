@@ -28,6 +28,11 @@ runs:
           exit 1
         fi
 
+        # Ensure KNOT has https:// prefix
+        if [[ ! "$KNOT" =~ ^https?:// ]]; then
+          KNOT="https://${KNOT}"
+        fi
+
         mkdir -p "$DEST"
         cd "$DEST"
 
