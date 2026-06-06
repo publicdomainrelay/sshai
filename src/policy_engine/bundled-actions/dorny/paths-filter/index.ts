@@ -4,7 +4,7 @@ import { globToRegExp } from "jsr:@std/path/posix";
 const knot = Deno.env.get("SPINDLE_KNOT") ?? "";
 const repoDid = Deno.env.get("SPINDLE_REPO_DID") ?? "";
 const baseRef = Deno.env.get("INPUT_BASE") ?? "main";
-const currRef = Deno.env.get("INPUT_REF") || Deno.env.get("GITHUB_SHA") ?? "";
+const currRef = Deno.env.get("INPUT_REF") || (Deno.env.get("GITHUB_SHA") ?? "");
 const filtersYaml = Deno.env.get("INPUT_FILTERS") ?? "";
 const githubOutput = Deno.env.get("GITHUB_OUTPUT") ?? "";
 
