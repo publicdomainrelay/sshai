@@ -78,15 +78,18 @@ func findBinary(name string) string {
 
 // ExecuteWorkflow executes a parsed workflow.
 func (e *WorkflowExecutor) ExecuteWorkflow(ctx context.Context, request *PolicyEngineRequest) (*PolicyEngineStatus, error) {
+	Info("executing workflow")
 	workflow, err := ParseWorkflow(request.Workflow)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse workflow: %w", err)
 	}
+	Info("workflow parsed: name=%q jobs=%d", workflow.Name, len(workflow.Jobs))
 
 	// Initialize context from request
 	if err := e.initializeContext(request); err != nil {
 		return nil, fmt.Errorf("failed to initialize context: %w", err)
 	}
+	Debug("context initialized: workspace=%s", e.Context.Workspace)
 
 	// Clean up ephemeral directories when done.
 	// CacheDir is intentionally kept (persists downloaded actions between runs).
@@ -104,13 +107,17 @@ func (e *WorkflowExecutor) ExecuteWorkflow(ctx context.Context, request *PolicyE
 
 	// Execute each job
 	for jobName, job := range workflow.Jobs {
+		Info("starting job: %s (steps=%d)", jobName, len(job.Steps))
 		if err := e.executeJob(ctx, jobName, &job); err != nil {
+			LogError("job %s failed: %v", jobName, err)
 			// Record error but continue to allow cleanup
 			e.Context.Error = err
 			return e.createErrorStatus(err), nil
 		}
+		Info("job %s completed successfully", jobName)
 	}
 
+	Info("workflow completed successfully")
 	return e.createSuccessStatus(), nil
 }
 
@@ -200,8 +207,16 @@ func (e *WorkflowExecutor) executeJob(ctx context.Context, jobName string, job *
 				return fmt.Errorf("failed to evaluate if condition for step %s: %w", stepName, err)
 			}
 			if !shouldRun {
+				Info("step %s skipped (if condition false)", stepName)
 				continue
 			}
+		}
+
+		Info("starting step: %s", stepName)
+		if step.Uses != "" {
+			Debug("step %s uses action: %s", stepName, step.Uses)
+		} else if step.Run != "" {
+			Debug("step %s run script:\n%s", stepName, step.Run)
 		}
 
 		// Set shell if specified
@@ -234,9 +249,11 @@ func (e *WorkflowExecutor) executeJob(ctx context.Context, jobName string, job *
 		}
 
 		if err != nil {
+			LogError("step %s failed: %v", stepName, err)
 			e.Context.ConsoleOutput = append(e.Context.ConsoleOutput, fmt.Sprintf("##[error]step %s failed: %v", stepName, err))
 			return fmt.Errorf("step %s failed: %w", stepName, err)
 		}
+		Info("step %s completed", stepName)
 	}
 
 	return nil
@@ -560,6 +577,7 @@ func (e *WorkflowExecutor) executeStepUses(ctx context.Context, step *PolicyEngi
 		if _, err := os.Stat(actionPath); os.IsNotExist(err) {
 			return fmt.Errorf("local action path does not exist: %s", actionPath)
 		}
+		Debug("action resolved from local path: %s", actionPath)
 	} else if strings.Contains(step.Uses, "@") {
 		// Remote action: org/repo@version
 		// Resolution order:
@@ -578,6 +596,7 @@ func (e *WorkflowExecutor) executeStepUses(ctx context.Context, step *PolicyEngi
 			repoLocal := filepath.Join(repoActionsDir, orgRepo)
 			if _, err := os.Stat(repoLocal); err == nil {
 				actionPath = repoLocal
+				Debug("action %s resolved from repo-supplied dir: %s", orgRepo, actionPath)
 			}
 		}
 		if actionPath == "" {
@@ -585,16 +604,19 @@ func (e *WorkflowExecutor) executeStepUses(ctx context.Context, step *PolicyEngi
 				bundledPath := filepath.Join(bundledDir, orgRepo)
 				if _, err := os.Stat(bundledPath); err == nil {
 					actionPath = bundledPath
+					Debug("action %s resolved from bundled dir: %s", orgRepo, actionPath)
 				}
 			}
 		}
 
 		if actionPath == "" {
+			Debug("downloading action %s@%s from GitHub", orgRepo, version)
 			var err error
 			actionPath, err = e.downloadAction(orgRepo, version)
 			if err != nil {
 				return fmt.Errorf("failed to download action: %w", err)
 			}
+			Debug("action %s downloaded to: %s", orgRepo, actionPath)
 		}
 	} else {
 		return fmt.Errorf("unsupported uses format (expected org/repo@version or ./path): %s", step.Uses)
@@ -640,6 +662,7 @@ func (e *WorkflowExecutor) executeStepUses(ctx context.Context, step *PolicyEngi
 	env["GITHUB_ACTION_PATH"] = actionPath
 
 	// Execute based on action type
+	Debug("executing action type: %s", actionDef.Runs.Using)
 	switch {
 	case strings.HasPrefix(actionDef.Runs.Using, "node"):
 		return e.executeNodeAction(ctx, actionPath, actionDef.Runs.Main, env, step.ID)
@@ -919,6 +942,8 @@ func (e *WorkflowExecutor) executeStepRun(ctx context.Context, step *PolicyEngin
 
 // runShellCommand runs a shell command.
 func (e *WorkflowExecutor) runShellCommand(ctx context.Context, script, shell string, env map[string]string) error {
+	Debug("running shell command: shell=%s", shell)
+	Trace("script content:\n%s", script)
 	// Create temp file for the script
 	tmpFile, err := os.CreateTemp(e.Context.TempDir, "script-*")
 	if err != nil {
@@ -989,11 +1014,11 @@ func (e *WorkflowExecutor) runAndStreamOutput(cmd *exec.Cmd) (bytes.Buffer, erro
 		if n > 0 {
 			chunk := string(buf[:n])
 			output.WriteString(chunk)
-			// Stream each line to the task
-			if e.Task != nil {
-				lines := strings.Split(chunk, "\n")
-				for _, line := range lines {
-					if line != "" {
+			lines := strings.Split(chunk, "\n")
+			for _, line := range lines {
+				if line != "" {
+					Trace("| %s", line)
+					if e.Task != nil {
 						e.Task.AppendConsoleOutput(line)
 					}
 				}

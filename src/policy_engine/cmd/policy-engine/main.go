@@ -16,7 +16,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -173,6 +172,9 @@ var clientOutputCmd = &cobra.Command{
 
 // CLI flags
 var (
+	// Global flags
+	logLevel string
+
 	// API flags
 	apiBind     string
 	apiPortFile string
@@ -200,6 +202,12 @@ var (
 )
 
 func init() {
+	// Global flags (persistent across all subcommands)
+	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level: trace, debug, info, warn, error")
+	cobra.OnInitialize(func() {
+		common.SetLogLevel(logLevel)
+	})
+
 	// API command flags
 	apiCmd.Flags().StringVar(&apiBind, "bind", "127.0.0.1:8080", "Address to bind (host:port, :0 for random port, or /path/to/socket for Unix socket)")
 	apiCmd.Flags().StringVar(&apiPortFile, "port-file", "", "Write the bound address to this file after listening (useful with --bind :0)")
@@ -247,27 +255,27 @@ func defaultWorkers() int {
 }
 
 func runAPIServer(cmd *cobra.Command, args []string) {
-	log.Printf("Starting Policy Engine API server")
-	log.Printf("Bind: %s", apiBind)
-	log.Printf("Go routines will handle concurrent requests")
+	common.Info("starting policy engine API server (log-level=%s bind=%s)", logLevel, apiBind)
 
 	server := common.NewServer(apiBind)
 
 	// Create listener first so we know the bound address before serving.
 	ln, err := server.Listen()
 	if err != nil {
-		log.Fatalf("Listen error: %v", err)
+		common.LogError("listen error: %v", err)
+		os.Exit(1)
 	}
 
 	boundAddr := server.BoundAddr()
-	log.Printf("Listening on %s", boundAddr)
+	common.Info("listening on %s", boundAddr)
 
 	// Write port file if requested.
 	if apiPortFile != "" {
 		if err := os.WriteFile(apiPortFile, []byte(boundAddr), 0644); err != nil {
-			log.Fatalf("Failed to write port file %s: %v", apiPortFile, err)
+			common.LogError("failed to write port file %s: %v", apiPortFile, err)
+			os.Exit(1)
 		}
-		log.Printf("Wrote bound address to %s", apiPortFile)
+		common.Debug("wrote bound address to %s", apiPortFile)
 	}
 
 	// Handle graceful shutdown
@@ -276,11 +284,11 @@ func runAPIServer(cmd *cobra.Command, args []string) {
 
 	go func() {
 		<-sigChan
-		log.Println("Shutting down server...")
+		common.Info("shutting down server...")
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
-			log.Printf("Server shutdown error: %v", err)
+			common.LogError("server shutdown error: %v", err)
 		}
 		// Clean up port file on shutdown.
 		if apiPortFile != "" {
@@ -289,20 +297,20 @@ func runAPIServer(cmd *cobra.Command, args []string) {
 	}()
 
 	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Server error: %v", err)
+		common.LogError("server error: %v", err)
+		os.Exit(1)
 	}
 }
 
 func runWorker(cmd *cobra.Command, args []string) {
-	log.Println("Worker mode: In Go implementation, tasks are processed in-process with goroutines.")
-	log.Println("The API server handles all task processing automatically.")
-	log.Println("This command is provided for CLI compatibility with the Python version.")
+	common.Info("worker mode: tasks processed in-process with goroutines")
+	common.Debug("API server handles all task processing automatically")
 
 	// Just keep running
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
-	log.Println("Worker shutdown")
+	common.Info("worker shutdown")
 }
 
 func runClientCreate(cmd *cobra.Command, args []string) {
@@ -311,15 +319,23 @@ func runClientCreate(cmd *cobra.Command, args []string) {
 	// Load workflow
 	var workflow interface{}
 	if _, err := os.Stat(clientWorkflow); err == nil {
-		// It's a file
-		var err error
-		workflow, err = common.LoadWorkflowFromFile(clientWorkflow)
+		// It's a file — send raw content so server parses it
+		content, err := os.ReadFile(clientWorkflow)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading workflow: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error reading workflow file: %v\n", err)
 			os.Exit(1)
 		}
+		if _, err := common.ParseWorkflow(string(content)); err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid workflow: %v\n", err)
+			os.Exit(1)
+		}
+		workflow = string(content)
 	} else {
 		// Treat as inline YAML
+		if _, err := common.ParseWorkflow(clientWorkflow); err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid workflow: %v\n", err)
+			os.Exit(1)
+		}
 		workflow = clientWorkflow
 	}
 

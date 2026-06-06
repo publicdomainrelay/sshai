@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -96,13 +95,13 @@ func (s *Server) Listen() (net.Listener, error) {
 // Start starts the HTTP server. It calls ListenAndServe (TCP only, no port-file
 // support). Prefer Listen() + Serve() for port-file / unix socket workflows.
 func (s *Server) Start() error {
-	log.Printf("Starting policy engine API server on %s", s.httpServer.Addr)
+	Info("starting policy engine API server on %s", s.httpServer.Addr)
 	if sockPath, ok := isUnixSocket(s.bind); ok {
 		ln, err := s.Listen()
 		if err != nil {
 			return err
 		}
-		log.Printf("Listening on unix socket %s", sockPath)
+		Info("listening on unix socket %s", sockPath)
 		return s.httpServer.Serve(ln)
 	}
 	return s.httpServer.ListenAndServe()
@@ -186,6 +185,7 @@ func (s *Server) handleRequestCreate(w http.ResponseWriter, r *http.Request) {
 	// Create task
 	taskID := uuid.New().String()
 	task := s.taskManager.CreateTask(taskID)
+	Info("task created: id=%s", taskID)
 
 	// Execute workflow asynchronously
 	go s.executeWorkflowTask(task, &request)
@@ -471,6 +471,7 @@ jobs:
 		taskID = uuid.New().String()
 	}
 	task := s.taskManager.CreateTask(taskID)
+	Info("webhook task created: id=%s", taskID)
 
 	// Execute workflow asynchronously
 	go s.executeWorkflowTask(task, &request)
@@ -490,12 +491,14 @@ jobs:
 // executeWorkflowTask executes a workflow as an async task.
 func (s *Server) executeWorkflowTask(task *Task, request *PolicyEngineRequest) {
 	ctx := context.Background()
+	Debug("executing workflow task: id=%s", task.ID)
 
 	executor := NewWorkflowExecutor()
 	executor.Task = task
 	status, err := executor.ExecuteWorkflow(ctx, request)
 
 	if err != nil {
+		LogError("task %s failed: %v", task.ID, err)
 		s.taskManager.UpdateTask(task.ID, "FAILURE", "", err)
 		return
 	}
@@ -503,6 +506,7 @@ func (s *Server) executeWorkflowTask(task *Task, request *PolicyEngineRequest) {
 	// Serialize the status
 	resultJSON, err := json.Marshal(status)
 	if err != nil {
+		LogError("task %s: failed to serialize result: %v", task.ID, err)
 		s.taskManager.UpdateTask(task.ID, "FAILURE", "", err)
 		return
 	}
@@ -514,6 +518,7 @@ func (s *Server) executeWorkflowTask(task *Task, request *PolicyEngineRequest) {
 		}
 	}
 
+	Info("task %s completed: status=%s", task.ID, taskStatus)
 	s.taskManager.UpdateTask(task.ID, taskStatus, string(resultJSON), nil)
 }
 
@@ -555,8 +560,8 @@ func CORSMiddleware(next http.Handler) http.Handler {
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		log.Printf("%s %s", r.Method, r.URL.Path)
+		Debug("request: %s %s", r.Method, r.URL.Path)
 		next.ServeHTTP(w, r)
-		log.Printf("%s %s completed in %v", r.Method, r.URL.Path, time.Since(start))
+		Debug("response: %s %s completed in %v", r.Method, r.URL.Path, time.Since(start))
 	})
 }
