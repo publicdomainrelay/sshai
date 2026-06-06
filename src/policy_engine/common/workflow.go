@@ -774,10 +774,10 @@ func unzip(src, dest string) error {
 	return cmd.Run()
 }
 
-// executeNodeAction executes a Node.js action.
+// executeNodeAction executes a Node.js action using Deno (with Node compat) or node as fallback.
 func (e *WorkflowExecutor) executeNodeAction(ctx context.Context, actionPath, main string, env map[string]string, stepID string) error {
-	if e.NodeJSPath == "" {
-		return fmt.Errorf("node.js not found in PATH")
+	if e.DenoPath == "" && e.NodeJSPath == "" {
+		return fmt.Errorf("neither deno nor node.js found in PATH")
 	}
 
 	// Create GITHUB_OUTPUT, GITHUB_ENV, GITHUB_PATH, and GITHUB_STATE files
@@ -805,7 +805,14 @@ func (e *WorkflowExecutor) executeNodeAction(ctx context.Context, actionPath, ma
 
 	mainPath := filepath.Join(actionPath, main)
 
-	cmd := exec.CommandContext(ctx, e.NodeJSPath, mainPath)
+	var cmd *exec.Cmd
+	if e.DenoPath != "" {
+		// Deno 2.x has built-in Node.js compat; --allow-all grants the broad
+		// permissions that standard GitHub Actions expect.
+		cmd = exec.CommandContext(ctx, e.DenoPath, "run", "--allow-all", "--no-prompt", mainPath)
+	} else {
+		cmd = exec.CommandContext(ctx, e.NodeJSPath, mainPath)
+	}
 	cmd.Dir = e.Context.Workspace
 	cmd.Env = mapToEnvSlice(env)
 
