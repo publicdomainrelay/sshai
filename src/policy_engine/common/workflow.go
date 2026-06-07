@@ -814,14 +814,28 @@ func (e *WorkflowExecutor) executeNodeAction(ctx context.Context, actionPath, ma
 	var cmd *exec.Cmd
 	if e.DenoPath != "" {
 		// Many actions are bundled as CommonJS (e.g. ncc-compiled dist/index.js
-		// using __dirname/__filename), but Deno treats .js files as ES modules
-		// by default, which leaves __dirname undefined. Dropping a
-		// package.json with "type": "commonjs" at the action root tells Deno's
-		// Node compat layer to load the entry point as CommonJS. Skip this if
-		// the action already ships its own package.json.
+		// using __dirname/__filename). Node defaults a package.json with no
+		// "type" field to CommonJS, but Deno defaults it to ES modules, which
+		// leaves __dirname undefined. Ensure the action's package.json has
+		// "type": "commonjs" set explicitly so Deno's Node compat layer loads
+		// the entry point as CommonJS, without clobbering an existing file
+		// that already declares "type": "module".
 		actionPkgPath := filepath.Join(actionPath, "package.json")
-		if _, err := os.Stat(actionPkgPath); os.IsNotExist(err) {
-			os.WriteFile(actionPkgPath, []byte(`{"type":"commonjs"}`), 0644)
+		pkgData, err := os.ReadFile(actionPkgPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				os.WriteFile(actionPkgPath, []byte(`{"type":"commonjs"}`), 0644)
+			}
+		} else {
+			var pkg map[string]interface{}
+			if err := json.Unmarshal(pkgData, &pkg); err == nil {
+				if _, hasType := pkg["type"]; !hasType {
+					pkg["type"] = "commonjs"
+					if updated, err := json.Marshal(pkg); err == nil {
+						os.WriteFile(actionPkgPath, updated, 0644)
+					}
+				}
+			}
 		}
 
 		// Deno 2.x has built-in Node.js compat; --allow-all grants the broad
