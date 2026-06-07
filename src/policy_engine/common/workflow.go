@@ -428,6 +428,8 @@ const result = (%s);
 console.log(result)
 `, string(githubJSON), string(runnerJSON), string(stepsJSON), string(inputsJSON), transformed)
 
+	Trace("evaluateUsingJavaScript(%s): %s", codeBlock, jsCode)
+
 	// Write to temp file
 	tmpDir := e.Context.TempDir
 	if tmpDir == "" {

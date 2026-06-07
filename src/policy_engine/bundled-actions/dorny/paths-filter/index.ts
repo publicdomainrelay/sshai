@@ -45,10 +45,15 @@ for (const [name, patterns] of Object.entries(filters)) {
 }
 
 const changesJson = JSON.stringify(results);
-console.log(`Filter results: ${changesJson}`);
+// console.log(`Filter results: ${changesJson}`);
 
 if (githubOutput) {
-  await Deno.writeTextFile(githubOutput, `changes=${changesJson}\n`, {
-    append: true,
-  });
+  for (const [key, value] of Object.entries(results)) {
+    await Deno.writeTextFile(githubOutput, `${key}=${value}\n`, {
+      append: true,
+    });
+
+    const output = await Deno.readTextFile(githubOutput);
+    // console.log(`output: ${output}`);
+  }
 }
