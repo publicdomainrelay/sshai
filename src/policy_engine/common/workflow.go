@@ -286,6 +286,12 @@ func (e *WorkflowExecutor) evaluateCondition(condition interface{}) (bool, error
 			exprStr = "${{ " + exprStr + " }}"
 		}
 		evaluated := e.evaluateExpression(exprStr)
+		if strings.Contains(evaluated, "${{") {
+			// The expression could not be resolved (e.g. unknown step ID or
+			// output). Treat this as an error rather than silently running
+			// the step, matching GitHub Actions' fail-closed behavior.
+			return false, fmt.Errorf("could not evaluate expression %q", v)
+		}
 		evaluated = strings.ToLower(strings.TrimSpace(evaluated))
 		if evaluated == "__github_actions_always__" {
 			return true, nil
