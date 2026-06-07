@@ -807,6 +807,17 @@ func (e *WorkflowExecutor) executeNodeAction(ctx context.Context, actionPath, ma
 
 	var cmd *exec.Cmd
 	if e.DenoPath != "" {
+		// Many actions are bundled as CommonJS (e.g. ncc-compiled dist/index.js
+		// using __dirname/__filename), but Deno treats .js files as ES modules
+		// by default, which leaves __dirname undefined. Dropping a
+		// package.json with "type": "commonjs" at the action root tells Deno's
+		// Node compat layer to load the entry point as CommonJS. Skip this if
+		// the action already ships its own package.json.
+		actionPkgPath := filepath.Join(actionPath, "package.json")
+		if _, err := os.Stat(actionPkgPath); os.IsNotExist(err) {
+			os.WriteFile(actionPkgPath, []byte(`{"type":"commonjs"}`), 0644)
+		}
+
 		// Deno 2.x has built-in Node.js compat; --allow-all grants the broad
 		// permissions that standard GitHub Actions expect.
 		cmd = exec.CommandContext(ctx, e.DenoPath, "run", "--allow-all", "--no-prompt", mainPath)
