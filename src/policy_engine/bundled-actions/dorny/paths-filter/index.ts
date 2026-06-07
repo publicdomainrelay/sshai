@@ -3,7 +3,7 @@ import { globToRegExp } from "jsr:@std/path/posix";
 
 const knot = Deno.env.get("SPINDLE_KNOT") ?? "";
 const repoDid = Deno.env.get("SPINDLE_REPO_DID") ?? "";
-const baseRef = Deno.env.get("INPUT_BASE") ?? "main";
+const inputBase = Deno.env.get("INPUT_BASE") ?? "";
 const currRef = Deno.env.get("INPUT_REF") || (Deno.env.get("GITHUB_SHA") ?? "");
 const filtersYaml = Deno.env.get("INPUT_FILTERS") ?? "";
 const githubOutput = Deno.env.get("GITHUB_OUTPUT") ?? "";
@@ -16,6 +16,41 @@ if (!knot || !repoDid || !currRef || !filtersYaml) {
 }
 
 const knotUrl = knot.startsWith("http") ? knot : `https://${knot}`;
+
+interface TangledCommit {
+  hash?: string;
+  this?: string;
+}
+
+function commitHash(commit: TangledCommit): string | undefined {
+  return typeof commit.hash === "string" ? commit.hash : commit.this;
+}
+
+// When no base is given, mirror the ref's previous commit (i.e. the commit
+// immediately preceding currRef) so the diff covers just the latest push.
+async function findPreviousCommit(ref: string): Promise<string> {
+  const listUrl =
+    `${knotUrl}/xrpc/sh.tangled.git.temp.listCommits?repo=${encodeURIComponent(repoDid)}&ref=${encodeURIComponent(ref)}&limit=2`;
+  const resp = await fetch(listUrl);
+  if (!resp.ok) {
+    console.error(
+      `::error::paths-filter: failed to discover previous commit for "${ref}": ${resp.status} ${resp.statusText}`,
+    );
+    Deno.exit(1);
+  }
+  const data = await resp.json();
+  const commits: TangledCommit[] = data.commits ?? [];
+  const previous = commits[1] && commitHash(commits[1]);
+  if (!previous) {
+    console.error(
+      `::error::paths-filter: "${ref}" has no previous commit to compare against`,
+    );
+    Deno.exit(1);
+  }
+  return previous;
+}
+
+const baseRef = inputBase || (await findPreviousCommit(currRef));
 
 const compareUrl =
   `${knotUrl}/xrpc/sh.tangled.repo.compare?repo=${encodeURIComponent(repoDid)}&rev1=${encodeURIComponent(baseRef)}&rev2=${encodeURIComponent(currRef)}`;

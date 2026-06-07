@@ -395,6 +395,51 @@ func (e *WorkflowExecutor) evaluateInnerExpression(inner string) string {
 	return "${{ " + inner + " }}"
 }
 
+// convertBoolStrings recursively walks a value (maps, slices, etc.) and
+// converts string values "true" and "false" into actual booleans. This is
+// needed because step outputs are always stored as strings (as GitHub
+// Actions writes them to GITHUB_OUTPUT), but expressions like
+// `steps.x.outputs.y === true` expect a real boolean for the comparison to
+// succeed.
+func convertBoolStrings(value interface{}) interface{} {
+	switch v := value.(type) {
+	case string:
+		if v == "true" {
+			return true
+		}
+		if v == "false" {
+			return false
+		}
+		return v
+	case map[string]string:
+		converted := make(map[string]interface{}, len(v))
+		for key, val := range v {
+			converted[key] = convertBoolStrings(val)
+		}
+		return converted
+	case map[string]interface{}:
+		converted := make(map[string]interface{}, len(v))
+		for key, val := range v {
+			converted[key] = convertBoolStrings(val)
+		}
+		return converted
+	case map[string]map[string]interface{}:
+		converted := make(map[string]interface{}, len(v))
+		for key, val := range v {
+			converted[key] = convertBoolStrings(val)
+		}
+		return converted
+	case []interface{}:
+		converted := make([]interface{}, len(v))
+		for i, val := range v {
+			converted[i] = convertBoolStrings(val)
+		}
+		return converted
+	default:
+		return value
+	}
+}
+
 // evaluateUsingJavaScript evaluates an expression using Deno, matching the
 // Python _evaluate_using_javascript implementation. It constructs a JS file
 // with the github, runner, steps, and inputs contexts, then evaluates the
@@ -402,7 +447,10 @@ func (e *WorkflowExecutor) evaluateInnerExpression(inner string) string {
 func (e *WorkflowExecutor) evaluateUsingJavaScript(codeBlock string) (string, error) {
 	// Build contexts
 	githubCtx := e.buildGitHubContext()
-	stepsCtx := e.Context.Outputs
+	// Step outputs are always strings (e.g. "true"/"false" from GITHUB_OUTPUT).
+	// Convert those to real JS booleans so comparisons like
+	// `steps.x.outputs.y === true` behave as expected.
+	stepsCtx := convertBoolStrings(e.Context.Outputs)
 	inputsCtx := e.Context.Inputs
 
 	runnerCtx := map[string]interface{}{
