@@ -449,7 +449,7 @@ console.log(result)
 	// Run with Deno. Use "deno run" for clean output (no REPL prompts).
 	// The --no-prompt flag prevents permission prompts, and we allow read
 	// access to the temp dir for the eval file.
-	cmd := exec.Command(e.DenoPath, "run", "--no-prompt", jsPath)
+	cmd := exec.Command(e.DenoPath, denoRunArgs("--no-prompt", jsPath)...)
 	devnull, _ := os.Open(os.DevNull)
 	if devnull != nil {
 		cmd.Stdin = devnull
@@ -840,7 +840,7 @@ func (e *WorkflowExecutor) executeNodeAction(ctx context.Context, actionPath, ma
 
 		// Deno 2.x has built-in Node.js compat; --allow-all grants the broad
 		// permissions that standard GitHub Actions expect.
-		cmd = exec.CommandContext(ctx, e.DenoPath, "run", "--allow-all", "--no-prompt", mainPath)
+		cmd = exec.CommandContext(ctx, e.DenoPath, denoRunArgs("--allow-all", "--no-prompt", mainPath)...)
 	} else {
 		cmd = exec.CommandContext(ctx, e.NodeJSPath, mainPath)
 	}
@@ -1174,6 +1174,17 @@ func (e *WorkflowExecutor) parseAnnotations(output string) {
 func (e *WorkflowExecutor) parseOutputs(output string) {
 	// Node actions typically use core.setOutput which writes to GITHUB_OUTPUT
 	// The actual parsing is done in executeStepRun
+}
+
+// denoRunArgs builds the argument list for a "deno run" invocation, adding
+// "--quiet" to suppress package download messages (e.g. "Download
+// https://jsr.io/@std/yaml/meta.json") unless DEBUG_DENO_PACKAGES=1 is set.
+func denoRunArgs(args ...string) []string {
+	result := []string{"run"}
+	if os.Getenv("DEBUG_DENO_PACKAGES") != "1" {
+		result = append(result, "--quiet")
+	}
+	return append(result, args...)
 }
 
 // mapToEnvSlice converts a map to an environment slice.
