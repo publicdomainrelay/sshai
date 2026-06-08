@@ -548,9 +548,21 @@ console.log(result)
   ): Promise<void> {
     const runScript = this.evaluateExpression(step.run!);
 
-    const outputFile = await Deno.makeTempFile({ dir: this.ctx.tempDir, prefix: "output-", suffix: ".txt" });
-    const envFile = await Deno.makeTempFile({ dir: this.ctx.tempDir, prefix: "env-", suffix: ".txt" });
-    const pathFile = await Deno.makeTempFile({ dir: this.ctx.tempDir, prefix: "path-", suffix: ".txt" });
+    const outputFile = await Deno.makeTempFile({
+      dir: this.ctx.tempDir,
+      prefix: "output-",
+      suffix: ".txt",
+    });
+    const envFile = await Deno.makeTempFile({
+      dir: this.ctx.tempDir,
+      prefix: "env-",
+      suffix: ".txt",
+    });
+    const pathFile = await Deno.makeTempFile({
+      dir: this.ctx.tempDir,
+      prefix: "path-",
+      suffix: ".txt",
+    });
 
     env["GITHUB_OUTPUT"] = outputFile;
     env["GITHUB_ENV"] = envFile;
@@ -567,7 +579,9 @@ console.log(result)
         this.ctx.outputs[step.id]["outputs"] = outputs;
       }
 
-      for (const [k, v] of Object.entries(parseGitHubActionsOutputs(await readTextOrEmpty(envFile)))) {
+      for (
+        const [k, v] of Object.entries(parseGitHubActionsOutputs(await readTextOrEmpty(envFile)))
+      ) {
         this.ctx.env[k] = v;
       }
     } finally {

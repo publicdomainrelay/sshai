@@ -41,11 +41,14 @@ export function createApp(): { app: Hono; taskManager: TaskManager } {
   const taskManager = new TaskManager();
   const app = new Hono();
 
-  app.use("*", cors({
-    origin: "*",
-    allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: ["Content-Type", "Authorization"],
-  }));
+  app.use(
+    "*",
+    cors({
+      origin: "*",
+      allowMethods: ["GET", "POST", "OPTIONS"],
+      allowHeaders: ["Content-Type", "Authorization"],
+    }),
+  );
 
   // Request logging.
   app.use("*", async (c, next) => {
