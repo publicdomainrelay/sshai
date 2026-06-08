@@ -1,0 +1,19 @@
+{
+  "name": "policy-engine",
+  "version": "0.1.0",
+  "exports": "./main.ts",
+  "tasks": {
+    "api": "deno run --allow-all main.ts api",
+    "test": "deno test --allow-all"
+  },
+  "imports": {
+    "hono": "jsr:@hono/hono@^4.6.0",
+    "@std/yaml": "jsr:@std/yaml@^1.0.0",
+    "@std/uuid": "jsr:@std/uuid@^1.0.0",
+    "@std/fs": "jsr:@std/fs@^1.0.0",
+    "@std/path": "jsr:@std/path@^1.0.0"
+  },
+  "fmt": {
+    "lineWidth": 100
+  }
+}
