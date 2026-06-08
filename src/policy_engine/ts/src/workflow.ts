@@ -17,6 +17,8 @@ import {
   WorkflowExecutionContext,
 } from "./models.ts";
 import { Debug, Info, LogError, Trace } from "./logger.ts";
+import { ExpressionEvaluator } from "./eval.ts";
+import { resolveSandboxConfig, type SandboxConfig } from "./config.ts";
 
 /** Parse a workflow from a string (YAML) or an object. */
 export function parseWorkflow(input: unknown): PolicyEngineWorkflow {
@@ -46,13 +48,22 @@ interface ActionDef {
 
 /** Executes workflows. */
 export class WorkflowExecutor {
-  denoPath: string;
   ctx: WorkflowExecutionContext;
   task: Task | null = null;
+  readonly sandbox: SandboxConfig;
+  private evaluator: ExpressionEvaluator;
+  // Path to the deno binary, used only to run node-based `uses` actions (the
+  // action's own code) — never for evaluating ${{ }} expressions, which run
+  // in-process in the sandboxed worker. In net-only mode no action runs at all.
+  private denoPath: string;
 
-  constructor(denoPath = Deno.execPath()) {
-    this.denoPath = denoPath;
+  constructor(opts: { sandbox?: SandboxConfig; denoPath?: string } = {}) {
     this.ctx = new WorkflowExecutionContext();
+    this.sandbox = opts.sandbox ?? resolveSandboxConfig();
+    this.denoPath = opts.denoPath ?? Deno.execPath();
+    // The expression sandbox is granted network access only in net-only mode;
+    // it never receives filesystem or subprocess permissions.
+    this.evaluator = new ExpressionEvaluator({ allowNet: this.sandbox.netOnly });
   }
 
   /** Execute a parsed workflow and return its final status. */
@@ -84,6 +95,7 @@ export class WorkflowExecutor {
       await this.removeAll(this.ctx.workspace);
       await this.removeAll(this.ctx.toolCacheDir);
       await this.removeAll(this.ctx.homeDir);
+      this.evaluator.close();
     }
   }
 
@@ -122,6 +134,14 @@ export class WorkflowExecutor {
       this.ctx.env["GITHUB_TOKEN"] = token;
     }
 
+    // In net-only mode the engine must never touch the filesystem, so the
+    // ephemeral workspace/cache/home directories are not created. Any step
+    // that would need them is refused later (see assertExecAllowed).
+    if (this.sandbox.netOnly) {
+      Info("net-only sandbox: filesystem and subprocess execution are disabled");
+      return;
+    }
+
     const cwd = Deno.cwd();
     this.ctx.cacheDir = join(cwd, ".cache");
     this.ctx.tempDir = join(cwd, ".tempdir");
@@ -131,6 +151,18 @@ export class WorkflowExecutor {
     this.ctx.workspace = await Deno.makeTempDir({ dir: this.ctx.tempDir, prefix: "workspace-" });
     this.ctx.toolCacheDir = await Deno.makeTempDir({ dir: this.ctx.tempDir, prefix: "toolcache-" });
     this.ctx.homeDir = await Deno.makeTempDir({ dir: this.ctx.tempDir, prefix: "home-" });
+  }
+
+  /**
+   * Refuse operations that require the filesystem or subprocess execution when
+   * running in the net-only sandbox.
+   */
+  private assertExecAllowed(what: string): void {
+    if (this.sandbox.netOnly) {
+      throw new Error(
+        `${what} requires filesystem/exec access, which is disabled in net-only sandbox mode`,
+      );
+    }
   }
 
   /** Execute a single job. */
@@ -143,7 +175,7 @@ export class WorkflowExecutor {
       else if (step.name) stepName = step.name;
 
       if (step.if !== undefined && step.if !== null) {
-        if (!this.evaluateCondition(step.if)) {
+        if (!(await this.evaluateCondition(step.if))) {
           Info("step %s skipped (if condition false)", stepName);
           continue;
         }
@@ -152,7 +184,7 @@ export class WorkflowExecutor {
       Info("starting step: %s", stepName);
       if (step.shell) this.ctx.shell = step.shell;
 
-      const stepEnv = this.buildStepEnv(step);
+      const stepEnv = await this.buildStepEnv(step);
 
       this.emit(`##[group]${stepName}`);
 
@@ -189,7 +221,7 @@ export class WorkflowExecutor {
    * conditions without ${{ }} are wrapped before evaluation. Unresolved
    * expressions fail closed (return false via throw), matching GitHub Actions.
    */
-  evaluateCondition(condition: unknown): boolean {
+  async evaluateCondition(condition: unknown): Promise<boolean> {
     if (typeof condition === "boolean") return condition;
     if (typeof condition === "number") return condition !== 0;
     if (typeof condition === "string") {
@@ -200,7 +232,7 @@ export class WorkflowExecutor {
 
       let exprStr = condition;
       if (!exprStr.includes("${{")) exprStr = "${{ " + exprStr + " }}";
-      let evaluated = this.evaluateExpression(exprStr);
+      let evaluated = await this.evaluateExpression(exprStr);
       if (evaluated.includes("${{")) {
         throw new Error(`could not evaluate expression ${JSON.stringify(condition)}`);
       }
@@ -218,17 +250,17 @@ export class WorkflowExecutor {
   }
 
   /** Build the environment map for a step. */
-  buildStepEnv(step: PolicyEngineWorkflowJobStep): Record<string, string> {
+  async buildStepEnv(step: PolicyEngineWorkflowJobStep): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
 
     for (const [k, v] of Object.entries(this.ctx.env)) {
       env[k] = String(v);
     }
     for (const [k, v] of Object.entries(step.env ?? {})) {
-      env[k] = this.evaluateExpression(String(v));
+      env[k] = await this.evaluateExpression(String(v));
     }
     for (const [k, v] of Object.entries(step.with ?? {})) {
-      env["INPUT_" + k.toUpperCase()] = this.evaluateExpression(String(v));
+      env["INPUT_" + k.toUpperCase()] = await this.evaluateExpression(String(v));
     }
 
     env["GITHUB_WORKSPACE"] = this.ctx.workspace;
@@ -241,17 +273,28 @@ export class WorkflowExecutor {
   }
 
   /** Evaluate all ${{ ... }} occurrences in a string. */
-  evaluateExpression(expr: string): string {
+  async evaluateExpression(expr: string): Promise<string> {
     if (!expr.includes("${{")) return expr;
-    return expr.replace(/\$\{\{\s*([\s\S]+?)\s*\}\}/g, (_m, inner: string) => {
-      return this.evaluateInnerExpression(inner.trim());
-    });
+    const re = /\$\{\{\s*([\s\S]+?)\s*\}\}/g;
+    let result = "";
+    let last = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(expr)) !== null) {
+      result += expr.slice(last, m.index);
+      result += await this.evaluateInnerExpression(m[1].trim());
+      last = m.index + m[0].length;
+    }
+    result += expr.slice(last);
+    return result;
   }
 
-  /** Evaluate a single expression (content between ${{ and }}) using Deno. */
-  private evaluateInnerExpression(inner: string): string {
+  /**
+   * Evaluate a single expression (content between ${{ and }}) natively in the
+   * sandboxed worker. Falls back to simple property-path resolution on error.
+   */
+  private async evaluateInnerExpression(inner: string): Promise<string> {
     try {
-      return this.evaluateUsingJavaScript(inner);
+      return await this.evaluateUsingJavaScript(inner);
     } catch {
       // Fall back to simple property-path resolution.
       const data: Record<string, unknown> = {
@@ -267,10 +310,11 @@ export class WorkflowExecutor {
   }
 
   /**
-   * Evaluate an expression by constructing a JS file with the github, runner,
-   * steps, and inputs contexts and running it with Deno.
+   * Evaluate an expression as JavaScript inside the permission-restricted
+   * worker. The github, runner, steps, and inputs contexts are embedded in a
+   * self-contained IIFE — no subprocess is spawned and no file is written.
    */
-  private evaluateUsingJavaScript(codeBlock: string): string {
+  private async evaluateUsingJavaScript(codeBlock: string): Promise<string> {
     const githubCtx = this.buildGitHubContext();
     const stepsCtx = convertBoolStrings(this.ctx.outputs);
     const inputsCtx = this.ctx.inputs;
@@ -278,38 +322,17 @@ export class WorkflowExecutor {
 
     const transformed = transformPropertyAccessors(codeBlock);
 
-    const jsCode = `function always() { return "__GITHUB_ACTIONS_ALWAYS__"; }
+    const jsCode = `(() => {
+function always() { return "__GITHUB_ACTIONS_ALWAYS__"; }
 const github = ${JSON.stringify(githubCtx)};
 const runner = ${JSON.stringify(runnerCtx)};
 const steps = ${JSON.stringify(stepsCtx)};
 const inputs = ${JSON.stringify(inputsCtx)};
-const result = (${transformed});
-console.log(result)
-`;
+return (${transformed});
+})()`;
     Trace("evaluateUsingJavaScript(%s): %s", codeBlock, jsCode);
 
-    const jsPath = Deno.makeTempFileSync({ dir: this.ctx.tempDir || undefined, suffix: ".js" });
-    try {
-      Deno.writeTextFileSync(jsPath, jsCode);
-      const cmd = new Deno.Command(this.denoPath, {
-        args: denoRunArgs("--no-prompt", jsPath),
-        cwd: this.ctx.workspace || undefined,
-        stdin: "null",
-        stdout: "piped",
-        stderr: "piped",
-      });
-      const { code, stdout, stderr } = cmd.outputSync();
-      if (code !== 0) {
-        throw new Error(`deno evaluation failed: ${new TextDecoder().decode(stderr)}`);
-      }
-      return new TextDecoder().decode(stdout).trim();
-    } finally {
-      try {
-        Deno.removeSync(jsPath);
-      } catch {
-        // ignore
-      }
-    }
+    return await this.evaluator.evaluate(jsCode);
   }
 
   /** Build the github context for expression evaluation. */
@@ -334,6 +357,7 @@ console.log(result)
     step: PolicyEngineWorkflowJobStep,
     env: Record<string, string>,
   ): Promise<void> {
+    this.assertExecAllowed(`action "${step.uses}"`);
     const uses = step.uses!;
     let actionPath = "";
 
@@ -384,7 +408,7 @@ console.log(result)
     for (const [inputName, inputDef] of Object.entries(actionDef.inputs ?? {})) {
       const envKey = "INPUT_" + inputName.toUpperCase();
       if (env[envKey] === undefined && inputDef.default) {
-        env[envKey] = this.evaluateExpression(inputDef.default);
+        env[envKey] = await this.evaluateExpression(inputDef.default);
       }
     }
 
@@ -535,7 +559,7 @@ console.log(result)
       const shell = step.shell || this.ctx.shell;
       const stepEnv = { ...env };
       for (const [k, v] of Object.entries(step.env ?? {})) {
-        stepEnv[k] = this.evaluateExpression(v);
+        stepEnv[k] = await this.evaluateExpression(v);
       }
       await this.runShellCommand(step.run, shell, stepEnv);
     }
@@ -546,7 +570,8 @@ console.log(result)
     step: PolicyEngineWorkflowJobStep,
     env: Record<string, string>,
   ): Promise<void> {
-    const runScript = this.evaluateExpression(step.run!);
+    this.assertExecAllowed("run step");
+    const runScript = await this.evaluateExpression(step.run!);
 
     const outputFile = await Deno.makeTempFile({
       dir: this.ctx.tempDir,

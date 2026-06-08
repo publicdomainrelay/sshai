@@ -1,14 +1,20 @@
-#!/usr/bin/env -S deno run --allow-all
+#!/usr/bin/env -S deno run --allow-all --unstable-worker-options
 // Policy engine CLI entrypoint (Deno + Hono).
 //
+// Expression evaluation runs in an in-process, permission-restricted Web
+// Worker (never a `deno run` subprocess), which requires the
+// --unstable-worker-options flag — already present in the shebang and the
+// deno tasks.
+//
 // Usage:
-//   deno run --allow-all main.ts api [--bind 127.0.0.1:8080]
-//   deno run --allow-all main.ts run --workflow <file|inline> [--input k=v ...]
+//   deno run --allow-all --unstable-worker-options main.ts api [--bind ...] [--net-only]
+//   deno run --allow-all --unstable-worker-options main.ts run --workflow <file|inline> [--net-only]
 
 import { parseArgs } from "@std/cli/parse-args";
 import { createApp, parseBind } from "./src/server.ts";
-import { type PolicyEngineRequest } from "./src/models.ts";
+import type { PolicyEngineRequest } from "./src/models.ts";
 import { WorkflowExecutor } from "./src/workflow.ts";
+import { resolveSandboxConfig } from "./src/config.ts";
 import { Info } from "./src/logger.ts";
 
 function usage(): never {
@@ -17,19 +23,33 @@ function usage(): never {
 Commands:
   api            Start the HTTP API server
                    --bind <addr>    Address to bind (default 127.0.0.1:8080)
+                   --net-only       Strict sandbox: expression eval gets network
+                                    access only; no filesystem, no exec, no
+                                    run/uses steps (env: POLICY_ENGINE_NET_ONLY)
   run            Execute a workflow locally and print the status JSON
                    --workflow <s>   Workflow file path or inline YAML (required)
                    --input k=v      Input pairs (repeatable)
                    --repository <s> org/repo (sets GITHUB_REPOSITORY)
+                   --net-only       See above
 `);
   Deno.exit(2);
 }
 
-async function cmdApi(args: string[]): Promise<void> {
-  const flags = parseArgs(args, { string: ["bind"], default: { bind: "127.0.0.1:8080" } });
-  const { app } = createApp();
+// --net-only resolves to: flag if present, else POLICY_ENGINE_NET_ONLY env var.
+function sandboxFromFlags(flags: { "net-only"?: boolean }) {
+  return resolveSandboxConfig(flags["net-only"] ? true : undefined);
+}
+
+function cmdApi(args: string[]): void {
+  const flags = parseArgs(args, {
+    string: ["bind"],
+    boolean: ["net-only"],
+    default: { bind: "127.0.0.1:8080" },
+  });
+  const sandbox = sandboxFromFlags(flags);
+  const { app } = createApp(sandbox);
   const opts = parseBind(flags.bind);
-  Info("starting policy engine API server on %s", flags.bind);
+  Info("starting policy engine API server on %s (net-only=%v)", flags.bind, sandbox.netOnly);
   // deno-lint-ignore no-explicit-any
   Deno.serve(opts as any, app.fetch);
 }
@@ -37,6 +57,7 @@ async function cmdApi(args: string[]): Promise<void> {
 async function cmdRun(args: string[]): Promise<void> {
   const flags = parseArgs(args, {
     string: ["workflow", "repository"],
+    boolean: ["net-only"],
     collect: ["input"],
   });
   if (!flags.workflow) usage();
@@ -66,7 +87,7 @@ async function cmdRun(args: string[]): Promise<void> {
     context: { config: { env } },
   };
 
-  const executor = new WorkflowExecutor();
+  const executor = new WorkflowExecutor({ sandbox: sandboxFromFlags(flags) });
   const status = await executor.executeWorkflow(request);
   console.log(JSON.stringify(status, null, 2));
 
