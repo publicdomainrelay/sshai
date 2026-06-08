@@ -20,6 +20,7 @@ import {
   validateRequest,
 } from "./models.ts";
 import { WorkflowExecutor } from "./workflow.ts";
+import { resolveSandboxConfig, type SandboxConfig } from "./config.ts";
 import { Debug, Info, LogError } from "./logger.ts";
 
 const DEFAULT_WEBHOOK_WORKFLOW = `
@@ -37,7 +38,9 @@ jobs:
 `;
 
 /** Build the Hono app and its backing task manager. */
-export function createApp(): { app: Hono; taskManager: TaskManager } {
+export function createApp(
+  sandbox: SandboxConfig = resolveSandboxConfig(),
+): { app: Hono; taskManager: TaskManager } {
   const taskManager = new TaskManager();
   const app = new Hono();
 
@@ -88,7 +91,7 @@ export function createApp(): { app: Hono; taskManager: TaskManager } {
     const task = taskManager.createTask(taskID);
     Info("task created: id=%s", taskID);
 
-    executeWorkflowTask(taskManager, task, request); // fire and forget
+    executeWorkflowTask(taskManager, task, request, sandbox); // fire and forget
 
     const response: PolicyEngineStatus = {
       status: StatusSubmitted,
@@ -235,7 +238,7 @@ export function createApp(): { app: Hono; taskManager: TaskManager } {
     const task = taskManager.createTask(taskID);
     Info("webhook task created: id=%s", taskID);
 
-    executeWorkflowTask(taskManager, task, request);
+    executeWorkflowTask(taskManager, task, request, sandbox);
 
     return c.json({ status: StatusSubmitted, detail: { id: taskID } });
   });
@@ -248,9 +251,10 @@ async function executeWorkflowTask(
   taskManager: TaskManager,
   task: Task,
   request: PolicyEngineRequest,
+  sandbox: SandboxConfig,
 ): Promise<void> {
   Debug("executing workflow task: id=%s", task.id);
-  const executor = new WorkflowExecutor();
+  const executor = new WorkflowExecutor({ sandbox });
   executor.task = task;
   try {
     const status = await executor.executeWorkflow(request);
