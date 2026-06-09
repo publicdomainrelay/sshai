@@ -18,6 +18,7 @@ import {
 } from "./models.ts";
 import { Debug, Info, LogError, Trace } from "./logger.ts";
 import { ExpressionEvaluator } from "./eval.ts";
+import { runActionInWorker } from "./action_worker.ts";
 import { resolveSandboxConfig, type SandboxConfig } from "./config.ts";
 
 /** Parse a workflow from a string (YAML) or an object. */
@@ -357,7 +358,6 @@ return (${transformed});
     step: PolicyEngineWorkflowJobStep,
     env: Record<string, string>,
   ): Promise<void> {
-    this.assertExecAllowed(`action "${step.uses}"`);
     const uses = step.uses!;
     let actionPath = "";
 
@@ -390,6 +390,15 @@ return (${transformed});
       }
 
       if (!actionPath) {
+        // Downloading requires writing to the cache directory; not available
+        // in the net-only sandbox. Actions must be supplied via a local path,
+        // ACTIONS_DIR, or BUNDLED_ACTIONS_DIR.
+        if (this.sandbox.netOnly) {
+          throw new Error(
+            `cannot download action ${orgRepo}@${version} in net-only mode; ` +
+              `provide it via a local path, ACTIONS_DIR, or BUNDLED_ACTIONS_DIR`,
+          );
+        }
         Debug("downloading action %s@%s from GitHub", orgRepo, version);
         actionPath = await this.downloadAction(orgRepo, version);
         Debug("action %s downloaded to: %s", orgRepo, actionPath);
@@ -417,11 +426,65 @@ return (${transformed});
     const using = actionDef.runs?.using ?? "";
     Debug("executing action type: %s", using);
     if (using.startsWith("node")) {
-      await this.executeNodeAction(actionPath, actionDef.runs?.main ?? "", env, step.id);
+      // In net-only mode the action runs in the permission-restricted worker;
+      // otherwise it runs as a full Deno subprocess (which also supports
+      // CommonJS/ncc bundles).
+      if (this.sandbox.netOnly) {
+        await this.executeNodeActionSandboxed(actionPath, actionDef.runs?.main ?? "", env, step.id);
+      } else {
+        await this.executeNodeActionSubprocess(
+          actionPath,
+          actionDef.runs?.main ?? "",
+          env,
+          step.id,
+        );
+      }
     } else if (using === "composite") {
+      // Composite actions execute shell steps, which require process execution.
+      this.assertExecAllowed("composite action");
       await this.executeCompositeAction(actionDef.runs?.steps ?? [], env);
     } else {
       throw new Error(`unsupported action type: ${using}`);
+    }
+  }
+
+  /**
+   * Run a JS/TS action's source in the sandboxed worker (net-only). The action
+   * gets network access (if enabled) but no filesystem or subprocess access;
+   * GITHUB_OUTPUT/GITHUB_ENV writes are captured via an in-memory virtual FS.
+   */
+  private async executeNodeActionSandboxed(
+    actionPath: string,
+    main: string,
+    env: Record<string, string>,
+    stepID: string | undefined,
+  ): Promise<void> {
+    const source = await Deno.readTextFile(join(actionPath, main));
+    const result = await runActionInWorker({
+      source,
+      env,
+      allowNet: this.sandbox.netOnly, // net granted in net-only mode
+      onLine: (line) => {
+        Trace("| %s", line);
+        this.ctx.consoleOutput.push(line);
+        if (this.task) this.task.appendConsoleOutput(line);
+        this.parseAnnotations(line);
+      },
+    });
+
+    if (stepID && result.output) {
+      const outputs = parseGitHubActionsOutputs(result.output);
+      if (!this.ctx.outputs[stepID]) this.ctx.outputs[stepID] = {};
+      this.ctx.outputs[stepID]["outputs"] = outputs;
+    }
+    if (result.env) {
+      for (const [k, v] of Object.entries(parseGitHubActionsOutputs(result.env))) {
+        this.ctx.env[k] = v;
+      }
+    }
+
+    if (result.code !== 0) {
+      throw new Error(`action exited with code ${result.code}`);
     }
   }
 
@@ -478,8 +541,11 @@ return (${transformed});
     throw new Error(`failed to download action from any URL: ${downloadErr?.message}`);
   }
 
-  /** Execute a Node.js action using Deno's Node compatibility layer. */
-  private async executeNodeAction(
+  /**
+   * Execute a Node.js action as a full Deno subprocess (Node compatibility
+   * layer). Used in the default sandbox; supports CommonJS/ncc bundles.
+   */
+  private async executeNodeActionSubprocess(
     actionPath: string,
     main: string,
     env: Record<string, string>,
