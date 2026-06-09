@@ -26,24 +26,30 @@ Commands:
                    --net-only       Strict sandbox: expression eval gets network
                                     access only; no filesystem, no exec, no
                                     run/uses steps (env: POLICY_ENGINE_NET_ONLY)
+                   --fs-api         Start an in-process HTTP filesystem API on a
+                                    random port and inject POLICY_ENGINE_FS_API_URL
+                                    into action workers (env: POLICY_ENGINE_FS_API)
   run            Execute a workflow locally and print the status JSON
                    --workflow <s>   Workflow file path or inline YAML (required)
                    --input k=v      Input pairs (repeatable)
                    --repository <s> org/repo (sets GITHUB_REPOSITORY)
                    --net-only       See above
+                   --fs-api         See above
 `);
   Deno.exit(2);
 }
 
-// --net-only resolves to: flag if present, else POLICY_ENGINE_NET_ONLY env var.
-function sandboxFromFlags(flags: { "net-only"?: boolean }) {
-  return resolveSandboxConfig(flags["net-only"] ? true : undefined);
+function sandboxFromFlags(flags: { "net-only"?: boolean; "fs-api"?: boolean }) {
+  return resolveSandboxConfig({
+    netOnly: flags["net-only"] ? true : undefined,
+    fsApi: flags["fs-api"] ? true : undefined,
+  });
 }
 
 function cmdApi(args: string[]): void {
   const flags = parseArgs(args, {
     string: ["bind"],
-    boolean: ["net-only"],
+    boolean: ["net-only", "fs-api"],
     default: { bind: "127.0.0.1:8080" },
   });
   const sandbox = sandboxFromFlags(flags);
@@ -57,7 +63,7 @@ function cmdApi(args: string[]): void {
 async function cmdRun(args: string[]): Promise<void> {
   const flags = parseArgs(args, {
     string: ["workflow", "repository"],
-    boolean: ["net-only"],
+    boolean: ["net-only", "fs-api"],
     collect: ["input"],
   });
   if (!flags.workflow) usage();

@@ -156,7 +156,9 @@ export function runActionInWorker(opts: {
         env: false,
         sys: false,
         ffi: false,
-        import: false,
+        // Allow JSR/npm imports when network is available so net-only actions
+        // can use dynamic import("jsr:@std/yaml") etc.
+        import: opts.allowNet ? true : false,
       },
     },
   });

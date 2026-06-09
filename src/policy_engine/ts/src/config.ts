@@ -17,6 +17,9 @@
  */
 export interface SandboxConfig {
   netOnly: boolean;
+  /** When true, start an in-process HTTP filesystem API server and inject its
+   *  URL as POLICY_ENGINE_FS_API_URL into every action worker. */
+  fsApi?: boolean;
 }
 
 /** Interpret common truthy strings ("1", "true", "yes", "on") as true. */
@@ -30,7 +33,14 @@ export function envBool(name: string): boolean {
  * takes precedence; otherwise the POLICY_ENGINE_NET_ONLY environment variable
  * is consulted. Defaults to the unrestricted ("full") sandbox.
  */
-export function resolveSandboxConfig(flag?: boolean): SandboxConfig {
-  const netOnly = flag !== undefined ? flag : envBool("POLICY_ENGINE_NET_ONLY");
-  return { netOnly };
+export function resolveSandboxConfig(
+  flags?: { netOnly?: boolean; fsApi?: boolean },
+): SandboxConfig {
+  const netOnly = flags?.netOnly !== undefined
+    ? flags.netOnly
+    : envBool("POLICY_ENGINE_NET_ONLY");
+  const fsApi = flags?.fsApi !== undefined
+    ? flags.fsApi
+    : envBool("POLICY_ENGINE_FS_API");
+  return { netOnly, fsApi };
 }

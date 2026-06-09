@@ -1,0 +1,28 @@
+name: Paths Filter
+description: >
+  Filters changed files by path patterns and sets outputs for each filter.
+  Drop-in replacement for dorny/paths-filter using the tangled knot XRPC API.
+inputs:
+  filters:
+    description: >
+      YAML map of filter names to glob pattern lists. Example:
+        src:
+          - 'src/**'
+        docs:
+          - 'docs/**'
+    required: true
+  base:
+    description: Base ref to compare against
+    default: main
+  ref:
+    description: Current ref (defaults to GITHUB_SHA)
+    default: ""
+outputs:
+  changes:
+    description: >
+      JSON object mapping filter names to booleans.
+      Example: {"src": true, "docs": false}
+    value: ${{ steps.filter.outputs.changes }}
+runs:
+  using: node20
+  main: index.ts
