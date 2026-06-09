@@ -1,0 +1,14 @@
+name: Tangled Checkout
+description: >
+  Fetches the repository from the knot via XRPC instead of GitHub.
+  Replaces actions/checkout for use in the tangled spindle environment.
+inputs:
+  ref:
+    description: The commit SHA or ref to check out
+    default: ""
+  path:
+    description: Relative path under workspace to place the repository
+    default: ""
+runs:
+  using: node20
+  main: index.ts

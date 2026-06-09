@@ -20,6 +20,7 @@ import { Debug, Info, LogError, Trace } from "./logger.ts";
 import { ExpressionEvaluator } from "./eval.ts";
 import { runActionInWorker } from "./action_worker.ts";
 import { resolveSandboxConfig, type SandboxConfig } from "./config.ts";
+import { type FsApiServer, startFsApiServer } from "./fs_api.ts";
 
 /** Parse a workflow from a string (YAML) or an object. */
 export function parseWorkflow(input: unknown): PolicyEngineWorkflow {
@@ -53,10 +54,9 @@ export class WorkflowExecutor {
   task: Task | null = null;
   readonly sandbox: SandboxConfig;
   private evaluator: ExpressionEvaluator;
-  // Path to the deno binary, used only to run node-based `uses` actions (the
-  // action's own code) — never for evaluating ${{ }} expressions, which run
-  // in-process in the sandboxed worker. In net-only mode no action runs at all.
   private denoPath: string;
+  // Lazily started FS API server (when sandbox.fsApi is true).
+  private fsApiServer: FsApiServer | null = null;
 
   constructor(opts: { sandbox?: SandboxConfig; denoPath?: string } = {}) {
     this.ctx = new WorkflowExecutionContext();
@@ -77,6 +77,12 @@ export class WorkflowExecutor {
     await this.initializeContext(request);
     Debug("context initialized: workspace=%s", this.ctx.workspace);
 
+    if (this.sandbox.fsApi) {
+      const fsRoot = this.ctx.workspace || await Deno.makeTempDir({ prefix: "pe-fsapi-" });
+      this.fsApiServer = await startFsApiServer(fsRoot);
+      Info("FS API server started at %s (root=%s)", this.fsApiServer.url, fsRoot);
+    }
+
     try {
       for (const [jobName, job] of Object.entries(jobs)) {
         Info("starting job: %s (steps=%d)", jobName, job.steps?.length ?? 0);
@@ -92,6 +98,10 @@ export class WorkflowExecutor {
       Info("workflow completed successfully");
       return this.createSuccessStatus();
     } finally {
+      if (this.fsApiServer) {
+        await this.fsApiServer.close();
+        this.fsApiServer = null;
+      }
       // Clean up ephemeral directories. cacheDir is intentionally kept.
       await this.removeAll(this.ctx.workspace);
       await this.removeAll(this.ctx.toolCacheDir);
@@ -269,6 +279,10 @@ export class WorkflowExecutor {
     env["RUNNER_TOOL_CACHE"] = this.ctx.toolCacheDir;
     env["AGENT_TOOLSDIRECTORY"] = this.ctx.toolCacheDir;
     env["HOME"] = this.ctx.homeDir;
+
+    if (this.fsApiServer) {
+      env["POLICY_ENGINE_FS_API_URL"] = this.fsApiServer.url;
+    }
 
     return env;
   }
